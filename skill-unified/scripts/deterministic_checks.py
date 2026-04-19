@@ -32,11 +32,20 @@ Each check returns:
 import sys
 import re
 import json
+import os
 import subprocess
 import time
 import urllib.request
 import urllib.parse
 from urllib.error import URLError, HTTPError
+
+# Share the question-intent-gated FAQ detector with the BEV layer so Phase 2
+# counts the same thing Phase 1 does. Prior code had a duplicate pattern list
+# that counted every <details>/<summary> pair, including country accordions.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from _bev_analyze import faq_visible_count as _faq_visible_count  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -100,35 +109,11 @@ def check_d9_faq_schema_match(html):
     Compare to FAQPage schema mainEntity count.
     Returns pass only if they match, fail if there's a mismatch.
     """
-    # Detection patterns — check ALL, use first match
-    patterns = [
-        ('details_summary', lambda h: min(
-            len(re.findall(r'<details[^>]*>', h, re.IGNORECASE)),
-            len(re.findall(r'<summary[^>]*>', h, re.IGNORECASE))
-        )),
-        ('dl_dt_dd', lambda h: min(
-            len(re.findall(r'<dt[^>]*>', h, re.IGNORECASE)),
-            len(re.findall(r'<dd[^>]*>', h, re.IGNORECASE))
-        ) if len(re.findall(r'<dt[^>]*>', h, re.IGNORECASE)) >= 3 else 0),
-        ('data_slot_accordion', lambda h: len(re.findall(
-            r'data-slot=["\']accordion-item["\']', h, re.IGNORECASE
-        ))),
-        ('class_accordion_item', lambda h: len(re.findall(
-            r'class=["\'][^"\']*(?:accordion-item|faq-item|faq-entry)', h, re.IGNORECASE
-        ))),
-        ('h3_question_headings', lambda h: len(re.findall(
-            r'<h3[^>]*>\s*[^<]*\?\s*</h3>', h, re.IGNORECASE
-        ))),
-    ]
-
-    visible_count = 0
-    detection_method = 'none'
-    for name, fn in patterns:
-        c = fn(html)
-        if c >= 3:  # need at least 3 to be confident
-            visible_count = c
-            detection_method = name
-            break
+    # Use the shared, question-intent-gated detector. Counts only
+    # <details>/<summary> pairs whose summary text actually looks like a
+    # question, plus the other accordion/FAQ-class signals. Returns
+    # ('none_detected' | 'empty_html' | <pattern_name>).
+    visible_count, detection_method = _faq_visible_count(html)
 
     # FAQPage schema count
     faq_schema_count = 0

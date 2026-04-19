@@ -55,16 +55,32 @@ PERP_RESULT=$(fetch "$PERP_UA" "${PREFIX}_perp.html" "$URL")
 CLAUDE_RESULT=$(fetch "$CLAUDE_UA" "${PREFIX}_claude.html" "$URL")
 NE_RESULT=$(fetch "$DEFAULT_UA" "${PREFIX}_404.html" "$NONEXISTENT_URL")
 
-# Delegate all parsing + classification to Python for consistency
-python3 "$(dirname "$0")/_bev_analyze.py" \
-  "$URL" "$NONEXISTENT_URL" \
+# Delegate all parsing + classification to Python. Contract: JSON on stdin,
+# JSON analysis on stdout. We build the stdin payload with a tiny inline
+# python3 script to avoid shell-escaping bugs on html paths / curl results.
+PAYLOAD=$(python3 - "$URL" "$NONEXISTENT_URL" \
   "${PREFIX}_default.html" "$DEFAULT_RESULT" \
   "${PREFIX}_gbot.html" "$GBOT_RESULT" \
   "${PREFIX}_gpt.html" "$GPT_RESULT" \
   "${PREFIX}_perp.html" "$PERP_RESULT" \
   "${PREFIX}_claude.html" "$CLAUDE_RESULT" \
-  "${PREFIX}_404.html" "$NE_RESULT"
+  "${PREFIX}_404.html" "$NE_RESULT" <<'PYEOF'
+import json, sys
+a = sys.argv[1:]
+url, probe_url = a[0], a[1]
+rest = a[2:]
+keys = ['default', 'gbot', 'gpt', 'perp', 'claude', 'not_found']
+probes = {k: {'html_file': rest[i*2], 'curl_result': rest[i*2 + 1]}
+          for i, k in enumerate(keys)}
+sys.stdout.write(json.dumps({'url': url, 'probe_url': probe_url, 'probes': probes}))
+PYEOF
+)
+
+printf '%s' "$PAYLOAD" | python3 "$(dirname "$0")/_bev_analyze.py"
+PY_EXIT=$?
 
 # Clean up temp files
 rm -f "${PREFIX}_default.html" "${PREFIX}_gbot.html" "${PREFIX}_gpt.html" \
       "${PREFIX}_perp.html" "${PREFIX}_claude.html" "${PREFIX}_404.html"
+
+exit "$PY_EXIT"

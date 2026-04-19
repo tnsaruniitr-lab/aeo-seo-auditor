@@ -321,11 +321,161 @@ def parse_curl_result(result_str: str) -> Dict:
 # Self-test when run directly
 # ----------------------------------------------------------------------
 
+def extract_first_h1(html_str: str) -> Optional[str]:
+    """Return the text inside the first <h1>, or None."""
+    if not html_str:
+        return None
+    m = re.search(r'<h1[^>]*>(.*?)</h1>', html_str, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    text = re.sub(r'<[^>]+>', ' ', m.group(1))
+    text = html_lib.unescape(text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text or None
+
+
+def _normalize_for_equality(html_str: str) -> str:
+    """Strip volatile tokens (nonces, timestamps) for content-equality comparison."""
+    if not html_str:
+        return ''
+    s = re.sub(r'nonce=["\'][^"\']+["\']', '', html_str, flags=re.IGNORECASE)
+    s = re.sub(r'csrf[_-]?token["\']?\s*[:=]\s*["\'][^"\']+["\']', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\d{10,}', '', s)  # long numeric IDs / unix timestamps
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def analyze_probe(html_str: str, curl_result: str) -> Dict:
+    """Analyze a single UA probe. Returns dict of all derived signals."""
+    curl = parse_curl_result(curl_result)
+    visible = visible_text(html_str)
+    wc = len([w for w in visible.split() if w.strip()])
+    faq_vc, faq_method = faq_visible_count(html_str)
+    return {
+        'http_code': curl['http_code'],
+        'size_bytes': curl['size_bytes'],
+        'ttfb_seconds': round(curl['ttfb_seconds'], 3),
+        'visible_words': wc,
+        'faq_visible': {'count': faq_vc, 'method': faq_method},
+        'faq_schema': faq_schema_count(html_str),
+        'spa_signals': detect_spa_signals(html_str),
+        'h1_first': extract_first_h1(html_str),
+    }
+
+
+def _run_cli(payload: Dict) -> Dict:
+    """
+    Deterministic orchestrator consumed by bots_eye_view.sh.
+
+    Expected payload shape:
+      {
+        "url": "...",
+        "probe_url": "...",
+        "probes": {
+          "default":   {"html_file": "...", "curl_result": "CODE SIZE TTFB"},
+          "gbot":      {...},
+          "gpt":       {...},
+          "perp":      {...},
+          "claude":    {...},
+          "not_found": {...}
+        }
+      }
+    """
+    url = payload.get('url') or ''
+    probe_url = payload.get('probe_url') or ''
+    probes_in = payload.get('probes') or {}
+
+    per_probe: Dict[str, Dict] = {}
+    html_by_probe: Dict[str, str] = {}
+    for name, entry in probes_in.items():
+        if not isinstance(entry, dict):
+            continue
+        html_str = safe_read(entry.get('html_file') or '')
+        html_by_probe[name] = html_str
+        per_probe[name] = analyze_probe(html_str, entry.get('curl_result') or '')
+
+    default_html = html_by_probe.get('default', '')
+    nf_html = html_by_probe.get('not_found', '')
+
+    # same-as-404: default page body indistinguishable from a guaranteed 404.
+    same_as_404 = False
+    if default_html and nf_html:
+        same_as_404 = (
+            _normalize_for_equality(default_html) == _normalize_for_equality(nf_html)
+            or (
+                visible_word_count(default_html) == visible_word_count(nf_html) > 0
+                and visible_text(default_html) == visible_text(nf_html)
+            )
+        )
+
+    # Cloaking: flag if any bot UA's visible-word count differs from default
+    # by > 20% and > 50 words. Conservative threshold to avoid noise.
+    default_wc = per_probe.get('default', {}).get('visible_words', 0)
+    cloaking_deltas: List[Dict] = []
+    cloaking_detected = False
+    for name in ('gbot', 'gpt', 'perp', 'claude'):
+        probe_wc = per_probe.get(name, {}).get('visible_words', 0)
+        if default_wc == 0 and probe_wc == 0:
+            continue
+        delta = probe_wc - default_wc
+        rel = (abs(delta) / default_wc) if default_wc else 1.0
+        entry = {'probe': name, 'visible_words': probe_wc, 'delta_vs_default': delta}
+        if abs(delta) > 50 and rel > 0.20:
+            entry['flagged'] = True
+            cloaking_detected = True
+        cloaking_deltas.append(entry)
+
+    classification = classify_ssr(
+        visible_words=default_wc,
+        same_as_404=same_as_404,
+        spa_signals=per_probe.get('default', {}).get('spa_signals', []),
+        h1_first=per_probe.get('default', {}).get('h1_first'),
+        html_snippet=default_html,
+    )
+
+    d = per_probe.get('default', {})
+    visible_faq = d.get('faq_visible', {}).get('count', 0)
+    schema_faq = d.get('faq_schema', 0)
+    if visible_faq == 0 and schema_faq == 0:
+        faq_integrity = 'na'
+    elif visible_faq == schema_faq:
+        faq_integrity = 'ok'
+    else:
+        faq_integrity = 'mismatch'
+
+    return {
+        'url': url,
+        'probe_url': probe_url,
+        'probes': per_probe,
+        'same_as_404': same_as_404,
+        'cloaking_detected': cloaking_detected,
+        'cloaking_deltas': cloaking_deltas,
+        'classification': classification,
+        'summary': {
+            'visible_words_default': default_wc,
+            'spa_signals': per_probe.get('default', {}).get('spa_signals', []),
+            'faq_visible': visible_faq,
+            'faq_schema': schema_faq,
+            'faq_integrity': faq_integrity,
+        },
+    }
+
+
 def _selftest():
     """Quick self-check: run against the bundled fixture files."""
     import os
     here = os.path.dirname(os.path.abspath(__file__))
-    fix_dir = os.path.join(here, '..', 'tests', 'fixtures')
+    fix_dir = None
+    for candidate in (
+        os.path.join(here, '..', 'tests', 'fixtures'),
+        os.path.join(here, '..', '..', 'tests', 'fixtures'),
+    ):
+        if os.path.isdir(candidate):
+            fix_dir = candidate
+            break
+    if fix_dir is None:
+        print('SKIP selftest — fixtures directory not found')
+        sys.exit(0)
 
     tests = [
         ('country_accordion_not_faq.html', 0, 'details_summary_question or none_detected'),
@@ -353,9 +503,34 @@ def _selftest():
     sys.exit(0 if all_ok else 1)
 
 
-if __name__ == '__main__':
+def main():
+    """
+    CLI entrypoint used by bots_eye_view.sh.
+
+    Reads a JSON payload from stdin describing the probes and emits a JSON
+    result on stdout. See `_run_cli` for payload shape.
+    """
     if len(sys.argv) > 1 and sys.argv[1] == '--selftest':
         _selftest()
-    else:
-        print('bev_analyze_v2 is a library. Use --selftest to run fixture checks.')
-        sys.exit(0)
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == '--help':
+        print('bev_analyze: pipe a JSON payload on stdin, receive JSON on stdout.')
+        print('  --selftest   run fixture-based self-check')
+        return
+
+    raw = sys.stdin.read()
+    if not raw.strip():
+        print(json.dumps({'error': 'empty stdin; expected JSON payload'}))
+        sys.exit(2)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(json.dumps({'error': f'invalid JSON on stdin: {e}'}))
+        sys.exit(2)
+
+    result = _run_cli(payload)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    main()
