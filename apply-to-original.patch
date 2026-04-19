@@ -1,0 +1,206 @@
+# Apply-to-original unified patch
+#
+# This file describes the minimal in-place edits to the original scripts
+# in skill/scripts/ that produce equivalent behavior to the v2 scripts,
+# for users who prefer to patch originals rather than run parallel v2 files.
+#
+# Apply with:
+#   cd <repo-root>
+#   patch -p1 --dry-run < apply-to-original.patch  # preview
+#   patch -p1 < apply-to-original.patch            # apply
+#
+# Reversible via:
+#   patch -p1 -R < apply-to-original.patch
+#
+# ----------------------------------------------------------------------
+# NOTE: This patch file is hand-written as a guide, NOT as a mechanically
+# verified unified diff. Line numbers in the original files may drift over
+# time. If `patch` rejects hunks, you have two options:
+#
+# 1. Apply the v2 scripts alongside instead (see scripts-v2/README.md)
+# 2. Use the descriptive patch below as a guide for manual edits
+#
+# Each hunk is labeled with the file, roughly which function/section it
+# touches, and what the edit does. The full v2 implementations in
+# scripts-v2/ are the authoritative source for the exact replacement text.
+# ----------------------------------------------------------------------
+
+
+## PATCH 1 — FAQ question-intent gate
+## Target: skill/scripts/_bev_analyze.py
+## Function: faq_visible_count()
+## Around lines: 117-121
+
+# ORIGINAL:
+#     details = re.findall(r'<details[^>]*>', html, re.IGNORECASE)
+#     summaries = re.findall(r'<summary[^>]*>', html, re.IGNORECASE)
+#     if details and summaries and min(len(details), len(summaries)) > 0:
+#         return min(len(details), len(summaries)), 'details_summary'
+
+# REPLACE WITH: (see scripts-v2/bev_analyze_v2.py for reference)
+#     # Pattern 1: <details><summary> WITH question-like summary text
+#     summaries = re.findall(
+#         r'<summary[^>]*>(.*?)</summary>', html, re.IGNORECASE | re.DOTALL
+#     )
+#     q_keywords = ('how ', 'what ', 'when ', 'where ', 'why ', 'which ',
+#                   'who ', 'can ', 'do ', 'does ', 'is ', 'are ',
+#                   'will ', 'should ')
+#     q_summaries = []
+#     for s in summaries:
+#         import html as html_lib
+#         text = re.sub(r'<[^>]+>', ' ', s).strip().lower()
+#         text = html_lib.unescape(text)
+#         if '?' in text or any(text.startswith(kw) for kw in q_keywords):
+#             q_summaries.append(s)
+#     if q_summaries:
+#         return len(q_summaries), 'details_summary_question'
+
+
+## PATCH 2 — SSR classification: add ssr_shell_js_hidden_content
+## Target: skill/scripts/_bev_analyze.py
+## Function: classify_ssr()
+## Around lines: 203-221
+
+# Replace the entire classify_ssr function with the version in
+# scripts-v2/bev_analyze_v2.py. Key addition: detect thin SSR + UI-action
+# H1 + rich Next.js bundle → return 'ssr_shell_js_hidden_content'.
+
+
+## PATCH 3 — Real XML parsing in sitemap
+## Target: skill/scripts/check_sitemap.py
+## Section: wherever <loc>/<lastmod> regex extraction happens
+
+# REMOVE all regex-based XML parsing:
+#   re.findall(r'<loc[^>]*>(.*?)</loc>', ...)
+#   re.findall(r'<lastmod[^>]*>(.*?)</lastmod>', ...)
+#
+# REPLACE WITH (import at top of file):
+#   import xml.etree.ElementTree as ET
+#
+# And use:
+#   SITEMAP_NS = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+#   root = ET.fromstring(xml_body)
+#   for url in root.findall('sm:url', SITEMAP_NS):
+#       loc_el = url.find('sm:loc', SITEMAP_NS)
+#       if loc_el is not None and loc_el.text:
+#           entries.append({'loc': loc_el.text.strip()})
+#
+# See scripts-v2/check_sitemap_v2.py::parse_sitemap_xml for the full
+# implementation including namespace fallback and CDATA handling.
+
+
+## PATCH 4 — HEAD-with-GET fallback for URL probing
+## Target: skill/scripts/check_sitemap.py
+## Function: wherever URL reachability is probed
+
+# ORIGINAL pattern (HEAD only):
+#   subprocess.run(['curl', '-I', '-sS', '-o', '/dev/null',
+#                   '-w', '%{http_code}', url], ...)
+
+# REPLACE WITH (HEAD then GET fallback):
+#   See scripts-v2/check_sitemap_v2.py::probe_url() — copy that function
+#   verbatim. It handles the 405/501 retry logic via Range request.
+
+
+## PATCH 5 — Per-PID wait in orchestrator
+## Target: skill/scripts/run_deterministic.sh
+
+# Around line 49 (the `wait $P1 $P2 $P3 $P4 $P5` line):
+#
+# ORIGINAL:
+#   set -euo pipefail
+#   ...
+#   wait $P1 $P2 $P3 $P4 $P5
+#
+# REPLACE WITH:
+#   set -uo pipefail  # NOT -e — handle per-PID failures
+#   ...
+#   for pid in $P1 $P2 $P3 $P4 $P5; do
+#     wait "$pid" 2>/dev/null || true
+#   done
+#
+# For full timeout + child-health reporting, see
+# scripts-v2/run_deterministic_v2.sh in its entirety.
+
+
+## PATCH 6 — Empty robots.txt tolerance
+## Target: skill/scripts/check_robots_txt.py
+## Function: parse_robots() or equivalent
+
+# Add an early guard at the top of the parse function:
+#
+#   def parse_robots_txt(body):
+#       if body is None or not body.strip():
+#           return {'groups': [], 'sitemaps': [], 'empty': True}
+#       # ... rest of parser
+#
+# And in the fetch layer, handle HTTP 4xx/5xx explicitly:
+#
+#   if http_code >= 400:
+#       # Treat as "no robots.txt" per RFC 9309 §2.3.1
+#       # All subsequent access checks must flag WARN, not PASS
+#       parsed = {'groups': [], 'sitemaps': [], 'empty': True,
+#                 'http_error': http_code}
+#
+# Full implementation in scripts-v2/check_robots_txt_v2.py.
+
+
+## PATCH 7 — Hreflang detection helper (new)
+## Target: skill/scripts/deterministic_checks.py
+## Action: ADD a new check
+
+# Add near the top of the file:
+#   try:
+#       from deterministic_checks_v2 import detect_hreflang
+#   except ImportError:
+#       detect_hreflang = None
+#
+# In the checks dispatcher, add:
+#   if detect_hreflang is not None:
+#       hr_result = detect_hreflang(html)
+#       checks['A8b_hreflang_presence'] = {
+#           'status': hr_result['status'],
+#           'severity': 'high' if hr_result['status'] == 'fail' else
+#                       'medium' if hr_result['status'] == 'warn' else 'info',
+#           'evidence': hr_result['evidence'],
+#           'detail': {
+#               'total': hr_result['total_count'],
+#               'toplevel': hr_result['toplevel_count'],
+#               'streamed': hr_result['streamed_count'],
+#               'locales': hr_result['locales'],
+#           }
+#       }
+#
+# The helper lives in scripts-v2/deterministic_checks_v2.py.
+
+
+## PATCH 8 — URL interpolation safety (general)
+## Multiple files
+
+# ANY subprocess call that passes a URL should use the list form, not
+# shell=True. Examples:
+#
+#   BAD:  subprocess.run(f'curl -sS "{url}"', shell=True)
+#   GOOD: subprocess.run(['curl', '-sS', url])
+#
+# ANY bash string interpolation of a URL should be avoided:
+#
+#   BAD:  bash "${SCRIPT_DIR}/bots_eye_view.sh" "$URL" > "$FILE"
+#         (if $URL was ever user-controlled it would be a shell injection)
+#   OK:   bash "${SCRIPT_DIR}/bots_eye_view.sh" "$URL" > "$FILE"
+#         (in this case $URL is argv-quoted, but audit all similar paths)
+#
+# For cases where a single-string URL form is genuinely required, use:
+#   from deterministic_checks_v2 import safe_url_for_shell
+#   safe = safe_url_for_shell(url)
+
+
+# ----------------------------------------------------------------------
+# Testing after applying patches
+# ----------------------------------------------------------------------
+#
+# After applying any patch, run:
+#   bash tests/run_tests.sh
+#
+# All 12 fixture assertions should pass. Any failure points at a
+# patch that wasn't applied cleanly.
