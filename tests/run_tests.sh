@@ -242,6 +242,85 @@ else
 fi
 
 # ----------------------------------------------------------------------
+# TEST 8: Unified orchestrator smoke test (canonical audit path)
+# ----------------------------------------------------------------------
+# Why this exists: previous regressions slipped through because every test
+# above this one imports library helpers directly. Nothing exercised
+# skill-unified/scripts/run_deterministic.sh, so the broken BEV CLI and the
+# missing macOS `timeout` both passed CI silently. This test stubs each of
+# the 5 children with a tiny script that emits fixed JSON, runs the
+# canonical orchestrator, and asserts the integration contract:
+#   * orchestrator emits valid JSON
+#   * every child's _child_status is "ok"
+#   * bots_eye_view.classification is present in the output
+#   * overall_summary.any_child_degraded is false
+echo ""
+echo "[8] unified orchestrator — canonical audit path smoke test"
+ORCH="${SCRIPT_DIR}/../skill-unified/scripts/run_deterministic.sh"
+if [ ! -f "$ORCH" ]; then
+    echo "  — SKIPPED (skill-unified orchestrator not present)"
+else
+    STUB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/auditor-smoke-XXXXXX")
+    trap 'rm -rf "'"$STUB_DIR"'"' EXIT
+
+    # Stub for BEV — the orchestrator invokes this via `bash <script> <url>`
+    cat > "${STUB_DIR}/bev.sh" <<'SH'
+#!/usr/bin/env bash
+cat <<'JSON'
+{"classification":"fully_accessible","summary":{"visible_words_default":620,"faq_integrity":"ok","critical_issues":[]},"probes":{}}
+JSON
+SH
+    chmod +x "${STUB_DIR}/bev.sh"
+
+    # Stub Python children — orchestrator invokes `python3 <script> <url>`.
+    # All four use the same body for brevity.
+    for name in det robots sitemap schema; do
+        cat > "${STUB_DIR}/${name}.py" <<PY
+import json
+print(json.dumps({"checks": {"${name}_smoke_check": {"status": "pass", "evidence": "stub ok"}}}))
+PY
+    done
+
+    SMOKE_OUT=$(BEV_SCRIPT_OVERRIDE="${STUB_DIR}/bev.sh" \
+        DET_SCRIPT_OVERRIDE="${STUB_DIR}/det.py" \
+        ROBOTS_SCRIPT_OVERRIDE="${STUB_DIR}/robots.py" \
+        SITEMAP_SCRIPT_OVERRIDE="${STUB_DIR}/sitemap.py" \
+        SCHEMA_SCRIPT_OVERRIDE="${STUB_DIR}/schema.py" \
+        bash "$ORCH" "https://smoke.example.com/" 2>&1)
+
+    # Parse via python on stdin (avoids any heredoc quoting hazards) so
+    # assertions key off real JSON paths, not fragile greps.
+    SMOKE_PARSED=$(printf '%s' "$SMOKE_OUT" | python3 -c "
+import json, sys
+raw = sys.stdin.read()
+try:
+    o = json.loads(raw)
+except Exception as e:
+    print(f'PARSE_FAIL={e}')
+    sys.exit(0)
+ch = (o.get('overall_summary') or {}).get('child_health') or {}
+print('DEGRADED=' + str((o.get('overall_summary') or {}).get('any_child_degraded')))
+print('CLASS=' + str((o.get('bots_eye_view') or {}).get('classification')))
+for name in ('bev', 'det', 'robots', 'sitemap', 'schema'):
+    print(f'CHILD_{name}=' + str((ch.get(name) or {}).get('status')))
+")
+
+    if [[ "$SMOKE_PARSED" == *"PARSE_FAIL"* ]]; then
+        FAIL=$((FAIL+1))
+        FAILURES+=("orchestrator output not valid JSON: $SMOKE_PARSED")
+        echo "  ✗ orchestrator did not produce valid JSON"
+        echo "    $SMOKE_PARSED"
+        echo "    First 200 chars of raw: ${SMOKE_OUT:0:200}"
+    else
+        assert_contains "orchestrator: bots_eye_view.classification present" "$SMOKE_PARSED" "CLASS=fully_accessible"
+        assert_contains "orchestrator: any_child_degraded is False" "$SMOKE_PARSED" "DEGRADED=False"
+        for name in bev det robots sitemap schema; do
+            assert_contains "orchestrator: child '${name}' health=ok" "$SMOKE_PARSED" "CHILD_${name}=ok"
+        done
+    fi
+fi
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 echo ""

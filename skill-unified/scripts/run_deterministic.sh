@@ -41,6 +41,19 @@ PER_SCRIPT_TIMEOUT=60
 # want to run them alongside v2 scripts)
 ORIG_DIR="${SCRIPT_DIR}"
 
+# Portable timeout: prefer GNU timeout / gtimeout when available, otherwise
+# fall back to a stdlib-only Python wrapper (_timeout.py). The previous
+# version called `timeout` directly, which produced exit 127 on macOS where
+# coreutils isn't installed — silently turning every child into
+# unparseable_output and running zero checks.
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(timeout "$PER_SCRIPT_TIMEOUT")
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(gtimeout "$PER_SCRIPT_TIMEOUT")
+else
+    TIMEOUT_CMD=(python3 "${SCRIPT_DIR}/_timeout.py" "$PER_SCRIPT_TIMEOUT")
+fi
+
 # Temp files for per-child output + exit code
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/auditor-v2-XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
@@ -55,7 +68,7 @@ run_child() {
     local exit_file="${TMP}/${label}.exit"
 
     (
-        timeout "${PER_SCRIPT_TIMEOUT}" "$@" > "$out_file" 2> "$err_file"
+        "${TIMEOUT_CMD[@]}" "$@" > "$out_file" 2> "$err_file"
         echo $? > "$exit_file"
     ) &
     eval "PID_${label}=$!"

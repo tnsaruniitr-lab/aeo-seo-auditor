@@ -46,6 +46,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 from _bev_analyze import faq_visible_count as _faq_visible_count  # noqa: E402
+# Hreflang detector that also walks Next.js streaming chunks (RSC payloads).
+# Prior to wiring this in, App Router sites with locales declared inside
+# self.__next_f.push(...) chunks reported zero hreflang in the audit output.
+from deterministic_checks_extras import detect_hreflang as _detect_hreflang  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -804,6 +808,33 @@ def check_d12_person_schema(html):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# CHECK D14: hreflang coverage (incl. Next.js streaming chunks)
+# ──────────────────────────────────────────────────────────────────────────
+
+def check_d14_hreflang_coverage(html):
+    """
+    Detect hreflang tags in the <head> AND inside Next.js streaming chunks
+    (self.__next_f.push). Catches the App Router false-negative where
+    locales declared in RSC payloads were invisible to the audit.
+
+    Wraps `_detect_hreflang` (in deterministic_checks_extras.py) so that
+    Phase 2 output carries an `hreflang_coverage` check entry like every
+    other deterministic check.
+    """
+    r = _detect_hreflang(html)
+    return {
+        'status': r.get('status', 'na'),
+        'evidence': r.get('evidence', ''),
+        'detail': {
+            'total_count': r.get('total_count', 0),
+            'toplevel_count': r.get('toplevel_count', 0),
+            'streamed_count': r.get('streamed_count', 0),
+            'locales': r.get('locales', []),
+        },
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Main orchestrator
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -833,6 +864,7 @@ def run_all_checks(url):
     results['checks']['D4_schema_id_coverage'] = check_d4_schema_id_coverage(html)
     results['checks']['C12b_datemodified_staleness'] = check_c12b_datemodified_staleness(html)
     results['checks']['D12_person_schema_with_credentials'] = check_d12_person_schema(html)
+    results['checks']['D14_hreflang_coverage'] = check_d14_hreflang_coverage(html)
 
     # Run checks that need network
     results['checks']['A4b_canonical_redirect_chain'] = check_a4b_canonical_redirect_chain(html, final_url)
