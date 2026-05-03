@@ -404,10 +404,37 @@ $('f').addEventListener('submit', async (e) => {
 
 async function poll(id) {
   const started = Date.now();
+  let consecutive404 = 0;
   while (true) {
     const r = await fetch('/audit/' + id);
-    const data = await r.json();
     const elapsed = Math.round((Date.now() - started) / 1000);
+
+    // 404 = audit not in server's JOBS dict. Either it was never created,
+    // or the server restarted (Railway redeploy) and the in-memory state
+    // was wiped. Tolerate 2 consecutive 404s in case of a race; bail on 3rd.
+    if (r.status === 404) {
+      consecutive404 += 1;
+      if (consecutive404 >= 3) {
+        out.innerHTML = renderError(
+          'Audit ' + id.slice(0,8) + '… not found on the server.\n\n' +
+          'Most likely cause: the service redeployed mid-audit (Railway in-memory ' +
+          'job state is wiped on every container restart). Please resubmit the URL.'
+        );
+        return;
+      }
+      await new Promise(r => setTimeout(r, 3000));
+      continue;
+    }
+    consecutive404 = 0;
+
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      out.innerHTML = renderError('Status check failed: HTTP ' + r.status +
+        (body ? '\n\n' + body.slice(0, 500) : ''));
+      return;
+    }
+
+    const data = await r.json();
 
     if (data.status === 'completed') {
       // Fetch full audit JSON for rich render
