@@ -1034,6 +1034,19 @@
         959
       ],
       "notes": "Rule 1668 (0.98) 'Organization Schema Must Include Name and URL.' AP#959 'Omitting Required url Property from Schema.org Entities.'"
+    },
+    "D14_hreflang_coverage": {
+      "category": "technical_seo",
+      "rules": [
+        1280,
+        920,
+        1281
+      ],
+      "anti_patterns": [
+        678,
+        379
+      ],
+      "notes": "Rule #1280 (Google, 0.97) 'Indicate hreflang for multi-language or multi-region page variants.' Rule #920 (Google, 0.95) 'Hreflang Annotation Requirement for Multilingual/Multi-Regional Sites.' Rule #1281 (Google, 0.96) 'Include self-referencing hreflang link on every page variant.' AP#678 (Google, high) 'Missing Self-Referencing hreflang Link on Page Variants.' AP#379 (Google, high) 'Incorrect hreflang annotations causing wrong canonical selection.'"
     }
   },
   "source_tiers": {

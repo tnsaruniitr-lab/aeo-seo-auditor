@@ -247,6 +247,18 @@ def query_brain(check_id: str, page_type: str = "homepage",
     """Query the Sieve brain for citations relevant to a given check_id.
 
     Returns top-N rules + anti-patterns ranked by tier ASC, confidence DESC.
+
+    Resolution order for the check_id:
+        1. Exact match  ('A2b_title_uniqueness_sample' → exact key)
+        2. Strip trailing letter from the numeric prefix
+           ('A2b_title_uniqueness_sample' → 'A2_*' prefix scan)
+        3. Bare-section prefix scan
+           ('A2b_anything' → first key starting with 'A2_')
+
+    This handles the case where the deterministic scripts emit sub-check IDs
+    like 'A2b_title_uniqueness_sample' (a sub-check of the parent A2) but
+    the brain mapping was authored against the parent 'A2_title_tag'. Falling
+    back to the parent gives reasonable citations for sub-checks.
     """
     try:
         from ranker import select_citations
@@ -254,9 +266,11 @@ def query_brain(check_id: str, page_type: str = "homepage",
     except Exception as e:
         return {"error": f"brain load: {type(e).__name__}: {e}", "citations": []}
 
+    resolved_id = _resolve_check_id(check_id, brain.check_to_rules)
+
     try:
         citations = select_citations(
-            brain=brain, check_id=check_id,
+            brain=brain, check_id=resolved_id,
             page_type=page_type, industry=industry,
             max_citations=max_citations,
         )
@@ -265,9 +279,45 @@ def query_brain(check_id: str, page_type: str = "homepage",
             for k in ("if_condition", "then_action", "description"):
                 if k in c and isinstance(c[k], str):
                     c[k] = c[k][:500]
-        return {"check_id": check_id, "citations": citations}
+        return {
+            "check_id": check_id,
+            "resolved_to": resolved_id if resolved_id != check_id else None,
+            "citations": citations,
+        }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "citations": []}
+
+
+def _resolve_check_id(check_id: str, mappings: Dict[str, Any]) -> str:
+    """Resolve a (possibly sub-check) ID to a key present in brain-mappings.
+
+    Examples:
+        'A2_title_tag'                 → 'A2_title_tag'                 (exact)
+        'A2b_title_uniqueness_sample'  → 'A2_title_tag'                 (strip 'b')
+        'D14_hreflang_coverage'        → 'D14_hreflang_coverage'        (exact)
+        'C12b_datemodified_staleness'  → 'C12_visible_date_staleness'   (parent prefix)
+        'unknown_check_id'             → 'unknown_check_id'             (no resolution)
+    """
+    if check_id in mappings:
+        return check_id
+
+    # Extract the section prefix (e.g. "A2b" → "A2", "C12b" → "C12")
+    import re
+    m = re.match(r"^([A-J])(\d+)([a-z])?(_.*)?$", check_id)
+    if not m:
+        return check_id  # not a section-style ID, return as-is
+
+    section, num, letter, suffix = m.groups()
+    bare_prefix = f"{section}{num}"
+
+    # Try the bare prefix as a key starter (e.g. "A2_")
+    candidates = [k for k in mappings if k.startswith(bare_prefix + "_")]
+    if candidates:
+        # If the original had a sub-letter (A2b), prefer non-sub-lettered keys
+        # If multiple, take the shortest/most generic name
+        return sorted(candidates, key=len)[0]
+
+    return check_id
 
 
 # ============================================================================
