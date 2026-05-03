@@ -320,16 +320,15 @@ def healthz():
         )
         stats = brain.stats()
         api_key_set = bool(os.getenv('ANTHROPIC_API_KEY'))
-        tavily_key_set = bool(os.getenv('TAVILY_API_KEY'))
         return {
             'status': 'ok',
             'brain_loaded': True,
             'brain_stats': stats,
             'anthropic_key_set': api_key_set,
-            'tavily_key_set': tavily_key_set,
             'audit_mode': AUDIT_MODE,
             'agent_available': AGENT_AVAILABLE,
             'agent_import_error': None if AGENT_AVAILABLE else _AGENT_IMPORT_ERROR,
+            'web_tools': 'anthropic_native_server_tools',
             'output_dir': str(OUTPUT_DIR),
         }
     except Exception as e:

@@ -1,28 +1,32 @@
 """
 tools.py — Tool implementations for the audit agent.
 
-Exposes 7 tools that mirror the capabilities the chat-based skill uses:
+Exposes 5 client-side tools the agent calls via Anthropic tool-use, plus
+declares 2 Anthropic SERVER-side tools (web_search, web_fetch) that run
+inside Anthropic's infrastructure with byte-for-byte parity to the chat
+WebSearch / WebFetch tools.
 
-    1. web_fetch(url, extract_prompt=None)        — fetch HTML, return structured digest
-    2. web_search(query, n=10)                    — Tavily API
-    3. render_page_js(url)                        — Playwright: post-JS HTML + perf metrics
-    4. run_deterministic_scripts(url)             — subprocess to skill-unified/scripts/run_deterministic.sh
-    5. query_brain(check_id, page_type, industry) — wraps ranker.select_citations
-    6. read_reference(name)                       — read skill-unified/references/{name}.md
-    7. persist_audit(audit_data)                  — Supabase INSERT (best-effort) + always local
+Client-side tools (we dispatch in dispatch_tool):
+    1. render_page_js(url)                        — Playwright: post-JS HTML + perf metrics
+    2. run_deterministic_scripts(url)             — subprocess to skill-unified/scripts/run_deterministic.sh
+    3. query_brain(check_id, page_type, industry) — wraps ranker.select_citations
+    4. read_reference(name)                       — read skill-unified/references/{name}.md
+    5. persist_audit(audit_data)                  — Supabase INSERT (best-effort) + always local
 
-Each tool is a plain Python function returning JSON-serializable dicts.
-TOOLS_SPEC at the bottom is the JSONSchema list passed to Anthropic messages.create
-so the agent can call them via tool-use.
+Server-side tools (Anthropic handles execution; we only declare in TOOLS_SPEC):
+    6. web_search                                 — Anthropic native ($10 / 1k searches)
+    7. web_fetch                                  — Anthropic native (free, only token costs)
 
 Design rules:
-    - Tools never raise. They catch all exceptions and return {"error": str}.
+    - Client tools never raise. They catch all exceptions and return {"error": str}.
     - Output payloads are bounded (truncate long fields) — keeps agent context small.
     - No tool depends on agent state — they're pure functions of their args + env.
+    - Server tools are dispatched by Anthropic itself; agent.py skips them in its
+      dispatch loop (they appear as web_search_tool_use / web_fetch_tool_use blocks
+      in the assistant message, with results inlined as *_tool_result blocks).
 
 ENV VARS
-    ANTHROPIC_API_KEY        (required by agent, not by these tools directly)
-    TAVILY_API_KEY           (required for web_search)
+    ANTHROPIC_API_KEY        (required — also pays for web_search/web_fetch usage)
     SUPABASE_URL             (optional, for persist_audit)
     SUPABASE_SERVICE_KEY     (optional, for persist_audit)
 """
@@ -37,7 +41,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
 # Paths
 THIS_DIR = Path(__file__).resolve().parent
@@ -49,251 +52,16 @@ sys.path.insert(0, str(RULESET_DIR))
 
 
 # ============================================================================
-# TOOL 1: web_fetch
+# NOTE: web_fetch and web_search are Anthropic SERVER-side tools.
+# They are NOT implemented here — Anthropic executes them. We only declare
+# them in TOOLS_SPEC at the bottom of this file. See:
+#   https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+#   https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
 # ============================================================================
-
-def web_fetch(url: str, extract_prompt: Optional[str] = None) -> Dict[str, Any]:
-    """Fetch a URL and return a structured digest of its content.
-
-    Returns:
-        {
-          "url": str,                    # final URL after redirects
-          "http_status": int,
-          "content_type": str,
-          "title": str,
-          "meta_description": str,
-          "canonical": str | None,
-          "meta_robots": str | None,
-          "h1": list[str],
-          "h2": list[str],
-          "h3": list[str],
-          "schema_blocks": list[dict],   # parsed JSON-LD
-          "open_graph": dict,
-          "visible_text_excerpt": str,   # first ~3000 words of body text
-          "word_count": int,
-          "internal_link_count": int,
-          "external_link_count": int,
-          "html_size_bytes": int,
-          "extracted": str | None,       # if extract_prompt given, Haiku extraction result
-        }
-
-    The structured digest is what the chat WebFetch tool effectively returns —
-    a parseable summary, not raw HTML. extract_prompt is optional: if given,
-    a cheap Haiku call answers the specific question against the cleaned text.
-    """
-    try:
-        import httpx
-        from selectolax.parser import HTMLParser
-    except ImportError as e:
-        return {"error": f"Missing dep: {e}. Install httpx + selectolax."}
-
-    try:
-        with httpx.Client(
-            follow_redirects=True,
-            timeout=30.0,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; AEO-Auditor/1.0)"},
-        ) as client:
-            r = client.get(url)
-        final_url = str(r.url)
-        html = r.text
-        status = r.status_code
-        ctype = r.headers.get("content-type", "")
-    except Exception as e:
-        return {"error": f"fetch failed: {type(e).__name__}: {e}"}
-
-    if not html or "html" not in ctype.lower():
-        return {
-            "url": final_url, "http_status": status, "content_type": ctype,
-            "error": "non-HTML or empty response",
-            "html_size_bytes": len(html or ""),
-        }
-
-    try:
-        tree = HTMLParser(html)
-    except Exception as e:
-        return {"error": f"HTML parse: {e}", "url": final_url, "http_status": status}
-
-    def text_or_none(node):
-        return node.text(strip=True) if node else None
-
-    def attr_or_none(node, name):
-        return node.attributes.get(name) if node else None
-
-    title = text_or_none(tree.css_first("title")) or ""
-    meta_desc_node = tree.css_first('meta[name="description"]')
-    meta_desc = attr_or_none(meta_desc_node, "content") or ""
-    canonical_node = tree.css_first('link[rel="canonical"]')
-    canonical = attr_or_none(canonical_node, "href")
-    meta_robots_node = tree.css_first('meta[name="robots"]')
-    meta_robots = attr_or_none(meta_robots_node, "content")
-
-    h1 = [n.text(strip=True) for n in tree.css("h1") if n.text(strip=True)]
-    h2 = [n.text(strip=True) for n in tree.css("h2") if n.text(strip=True)]
-    h3 = [n.text(strip=True) for n in tree.css("h3") if n.text(strip=True)]
-
-    # JSON-LD blocks
-    schema_blocks: List[Dict] = []
-    for node in tree.css('script[type="application/ld+json"]'):
-        raw = node.text(strip=False) or ""
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                schema_blocks.extend(p for p in parsed if isinstance(p, dict))
-            elif isinstance(parsed, dict):
-                schema_blocks.append(parsed)
-        except json.JSONDecodeError:
-            pass
-
-    # Open Graph
-    og: Dict[str, str] = {}
-    for node in tree.css('meta[property^="og:"]'):
-        prop = node.attributes.get("property", "")
-        content = node.attributes.get("content", "")
-        if prop and content:
-            og[prop[3:]] = content  # strip "og:"
-
-    # Visible body text
-    body = tree.css_first("body")
-    body_text = ""
-    if body:
-        # Strip script/style/nav/footer for cleaner excerpt
-        for sel in ("script", "style", "nav", "footer", "noscript", "svg"):
-            for n in body.css(sel):
-                n.decompose()
-        body_text = body.text(separator=" ", strip=True)
-        body_text = re.sub(r"\s+", " ", body_text)
-    word_count = len(body_text.split())
-    excerpt = " ".join(body_text.split()[:3000])
-
-    # Link counts
-    domain = urlparse(final_url).netloc
-    internal = external = 0
-    for a in tree.css("a[href]"):
-        href = a.attributes.get("href", "")
-        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
-            continue
-        if href.startswith("/"):
-            internal += 1
-        elif domain in href:
-            internal += 1
-        else:
-            external += 1
-
-    result = {
-        "url": final_url,
-        "http_status": status,
-        "content_type": ctype,
-        "title": title[:300],
-        "meta_description": meta_desc[:500],
-        "canonical": canonical,
-        "meta_robots": meta_robots,
-        "h1": h1[:10],
-        "h2": h2[:30],
-        "h3": h3[:50],
-        "schema_blocks": schema_blocks[:20],
-        "open_graph": og,
-        "visible_text_excerpt": excerpt,
-        "word_count": word_count,
-        "internal_link_count": internal,
-        "external_link_count": external,
-        "html_size_bytes": len(html),
-        "extracted": None,
-    }
-
-    # Optional Haiku extraction against the prompt
-    if extract_prompt and excerpt:
-        result["extracted"] = _haiku_extract(excerpt, extract_prompt)
-
-    return result
-
-
-def _haiku_extract(text: str, prompt: str) -> Optional[str]:
-    """Cheap targeted extraction via Haiku. ~$0.001 per call."""
-    try:
-        from anthropic import Anthropic
-    except ImportError:
-        return None
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None
-    try:
-        client = Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=1500,
-            system="You extract structured information from web page text. "
-                   "Be concise and faithful to the source. Do not invent facts.",
-            messages=[{
-                "role": "user",
-                "content": f"Page text:\n\n{text[:15000]}\n\n---\n\nTask: {prompt}",
-            }],
-        )
-        return msg.content[0].text.strip()
-    except Exception as e:
-        return f"(extract failed: {type(e).__name__}: {e})"
 
 
 # ============================================================================
-# TOOL 2: web_search (Tavily)
-# ============================================================================
-
-def web_search(query: str, n: int = 10) -> Dict[str, Any]:
-    """Search the web via Tavily API. Returns top-N organic results.
-
-    Returns:
-        {
-          "query": str,
-          "results": [
-            {"title": str, "url": str, "snippet": str, "score": float},
-            ...
-          ],
-          "answer": str | None,   # Tavily's own LLM-synthesized direct answer
-        }
-    """
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        return {"error": "TAVILY_API_KEY not set", "query": query, "results": []}
-
-    try:
-        import httpx
-    except ImportError:
-        return {"error": "httpx not installed", "query": query, "results": []}
-
-    try:
-        with httpx.Client(timeout=20.0) as client:
-            r = client.post(
-                "https://api.tavily.com/search",
-                json={
-                    "api_key": api_key,
-                    "query": query,
-                    "search_depth": "basic",
-                    "max_results": min(n, 20),
-                    "include_answer": True,
-                },
-            )
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}", "query": query, "results": []}
-
-    results = []
-    for item in data.get("results", [])[:n]:
-        results.append({
-            "title": item.get("title", "")[:300],
-            "url": item.get("url", ""),
-            "snippet": (item.get("content") or "")[:500],
-            "score": item.get("score"),
-        })
-
-    return {
-        "query": query,
-        "results": results,
-        "answer": data.get("answer"),
-    }
-
-
-# ============================================================================
-# TOOL 3: render_page_js (Playwright)
+# TOOL: render_page_js (Playwright)
 # ============================================================================
 
 def render_page_js(url: str) -> Dict[str, Any]:
@@ -424,7 +192,7 @@ def render_page_js(url: str) -> Dict[str, Any]:
 
 
 # ============================================================================
-# TOOL 4: run_deterministic_scripts
+# TOOL: run_deterministic_scripts
 # ============================================================================
 
 DETERMINISTIC_SCRIPT = SCRIPTS_DIR / "run_deterministic.sh"
@@ -596,9 +364,9 @@ def persist_audit(audit_data: Dict[str, Any]) -> Dict[str, Any]:
 # TOOL DISPATCH TABLE — used by agent.py
 # ============================================================================
 
+# Only CLIENT-side tools are dispatched in this table.
+# Server-side tools (web_search, web_fetch) are executed by Anthropic itself.
 TOOLS_IMPL = {
-    "web_fetch": web_fetch,
-    "web_search": web_search,
     "render_page_js": render_page_js,
     "run_deterministic_scripts": run_deterministic_scripts,
     "query_brain": query_brain,
@@ -606,52 +374,35 @@ TOOLS_IMPL = {
     "persist_audit": persist_audit,
 }
 
+# Names of Anthropic server-side tools — agent.py skips these in dispatch
+# (their tool_use blocks are handled by Anthropic's servers, with results
+# returned inline as *_tool_result blocks in the same assistant turn).
+SERVER_TOOL_NAMES = {"web_search", "web_fetch"}
+
 
 # ============================================================================
 # JSONSCHEMA SPEC FOR ANTHROPIC TOOL-USE API
 # ============================================================================
 
 TOOLS_SPEC = [
+    # ----- Anthropic SERVER-side tools -------------------------------------
+    # These are executed by Anthropic infrastructure (same backend the chat
+    # WebSearch / WebFetch tools use). We do not implement them in TOOLS_IMPL.
+    # Pricing: web_search = $10 per 1,000 searches; web_fetch = free (token
+    # costs only). Both work on claude-sonnet-4-6 with no beta header.
     {
-        "name": "web_fetch",
-        "description": (
-            "Fetch a URL and return a structured digest: title, meta tags, "
-            "headings, JSON-LD schema blocks, OG tags, visible text excerpt "
-            "(first 3000 words), word count, link counts, HTML size. "
-            "Use this for the target page (Phase 1 content fetch) and "
-            "competitor crawl (Phase 8). Optionally pass extract_prompt to "
-            "get a Haiku-extracted answer to a specific question."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "Absolute URL to fetch"},
-                "extract_prompt": {
-                    "type": "string",
-                    "description": "Optional. If provided, runs Haiku against the cleaned page text to answer this specific question. Example: 'List the author name, publication date, and any credentials shown.'",
-                },
-            },
-            "required": ["url"],
-        },
-    },
-    {
+        "type": "web_search_20250305",
         "name": "web_search",
-        "description": (
-            "Search the web via Tavily. Returns up to N organic results "
-            "(title, URL, snippet, relevance score) plus an LLM-synthesized "
-            "direct answer. Use for company context (Phase 3a), competitor "
-            "discovery (Phase 3b), and GEO brand presence (Phase 9)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "n": {"type": "integer", "default": 10,
-                      "description": "Number of results, max 20."},
-            },
-            "required": ["query"],
-        },
+        "max_uses": 8,  # cap per audit — covers Phase 3a/3b/3c (4 queries) + Phase 9 (2) + headroom
     },
+    {
+        "type": "web_fetch_20250910",
+        "name": "web_fetch",
+        "max_uses": 8,  # cap per audit — Phase 1 target + Phase 8 (5 competitors) + headroom
+        "citations": {"enabled": True},
+        "max_content_tokens": 100_000,
+    },
+    # ----- Client-side tools (we dispatch these in agent.py) ----------------
     {
         "name": "render_page_js",
         "description": (

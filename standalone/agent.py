@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
-from tools import TOOLS_SPEC, dispatch_tool
+from tools import TOOLS_SPEC, dispatch_tool, SERVER_TOOL_NAMES
 from system_prompt import SYSTEM_PROMPT
 
 
@@ -146,12 +146,20 @@ def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
             errors.append(f"unexpected stop_reason '{stop_reason}' at turn {turns}")
             break
 
-        # Run all tool_use blocks in this turn, collect tool_result blocks
+        # Run all CLIENT tool_use blocks. Server tools (web_search, web_fetch)
+        # are dispatched by Anthropic itself; their results appear inline as
+        # *_tool_result blocks in the same assistant turn — we don't process
+        # them here and the SDK handles serializing them in the next turn.
         tool_result_blocks: List[Dict[str, Any]] = []
         for block in response.content:
             if getattr(block, "type", None) != "tool_use":
                 continue
             name = block.name
+            if name in SERVER_TOOL_NAMES:
+                # Defensive: should never happen (server tools don't show up
+                # as plain "tool_use"), but skip cleanly if Anthropic ever
+                # changes the routing.
+                continue
             tinput = block.input or {}
 
             t0 = time.time()

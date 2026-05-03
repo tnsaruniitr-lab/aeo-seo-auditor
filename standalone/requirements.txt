@@ -5,6 +5,5 @@ anthropic>=0.40.0
 python-dotenv>=1.0.0
 
 # Agent-mode dependencies (parity layer)
-httpx>=0.27.0          # web_fetch, web_search (Tavily), persist_audit
-selectolax>=0.3.21     # fast HTML parser for web_fetch digest
+httpx>=0.27.0          # used by persist_audit (Supabase REST)
 playwright>=1.45.0     # render_page_js — JS rendering + perf metrics

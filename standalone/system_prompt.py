@@ -27,11 +27,16 @@ the relevant file. Do not guess thresholds — load the reference.
 
 # AVAILABLE TOOLS
 
-1. `web_fetch(url, extract_prompt?)` — fetch a URL, return structured digest \
-(title, meta, headings, JSON-LD, OG tags, visible text excerpt, link counts).
+1. `web_search(query)` — **Anthropic native server tool**. Searches the live web \
+and returns organic results (titles, URLs, snippets) plus encrypted_content for \
+follow-up. Same backend as the WebSearch tool used in chat. Capped at 8 uses \
+per audit. Use for company context (Phase 3a), competitor discovery (3b), and \
+GEO brand presence (Phase 9).
 
-2. `web_search(query, n?)` — Tavily search; returns organic results + a synthesized \
-direct answer.
+2. `web_fetch(url)` — **Anthropic native server tool**. Fetches a URL and returns \
+the page content as a document with citations enabled. Same backend as the \
+WebFetch tool used in chat. Capped at 8 uses per audit. Use for the target \
+page (Phase 1) and competitor crawl (Phase 8).
 
 3. `render_page_js(url)` — Playwright Chromium render: post-JS HTML size, perf \
 metrics (TTFB, LCP, CLS), console errors, SPA framework signals. Slower (~5–10s) \
