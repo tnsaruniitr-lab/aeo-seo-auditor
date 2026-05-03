@@ -23,10 +23,12 @@ ENV
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +39,8 @@ sys.path.insert(0, str(THIS_DIR))
 
 from tools import TOOLS_SPEC, dispatch_tool, SERVER_TOOL_NAMES
 from system_prompt import SYSTEM_PROMPT
+
+log = logging.getLogger('audit.agent')
 
 
 # -----------------------------------------------------------------------------
@@ -54,7 +58,8 @@ TOTAL_BUDGET_SECONDS = 480         # 8-minute hard ceiling per audit
 # CORE LOOP
 # -----------------------------------------------------------------------------
 
-def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
+def run_agent_loop(url: str, verbose: bool = False,
+                    log_prefix: str = '') -> Dict[str, Any]:
     """Drive the Claude tool-use loop until the agent emits <audit>...</audit>.
 
     Returns:
@@ -99,12 +104,16 @@ def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
     turns = 0
 
     started = time.time()
+    pfx = log_prefix or ''
+    log.info('%sloop start url=%s', pfx, url)
 
     for turn in range(MAX_AGENT_TURNS):
         turns = turn + 1
 
         if time.time() - started > TOTAL_BUDGET_SECONDS:
-            errors.append(f"hit total budget {TOTAL_BUDGET_SECONDS}s at turn {turns}")
+            msg = f"hit total budget {TOTAL_BUDGET_SECONDS}s at turn {turns}"
+            errors.append(msg)
+            log.warning('%s%s', pfx, msg)
             break
 
         try:
@@ -118,12 +127,18 @@ def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
         except Exception as e:
             errors.append(f"messages.create failed turn {turns}: "
                           f"{type(e).__name__}: {e}")
+            log.error('%smessages.create failed turn=%d: %s: %s',
+                      pfx, turns, type(e).__name__, e)
+            log.error('%s%s', pfx, traceback.format_exc())
             break
 
         input_tokens_total += response.usage.input_tokens
         output_tokens_total += response.usage.output_tokens
         stop_reason = response.stop_reason
 
+        log.info('%sturn=%d stop=%s in=%d out=%d',
+                 pfx, turns, stop_reason,
+                 response.usage.input_tokens, response.usage.output_tokens)
         if verbose:
             print(f"[turn {turns}] stop={stop_reason} "
                   f"in={response.usage.input_tokens} "
@@ -132,18 +147,38 @@ def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
         # Append assistant turn (includes text + tool_use blocks)
         messages.append({"role": "assistant", "content": response.content})
 
-        # Capture latest assistant text in case this is the end
+        # Capture latest assistant text + log a preview of reasoning,
+        # log server-tool invocations (which Anthropic dispatched itself).
         for block in response.content:
-            if getattr(block, "type", None) == "text":
-                raw_final_text = block.text or raw_final_text
+            btype = getattr(block, "type", None)
+            if btype == "text":
+                txt = (block.text or "").strip()
+                if txt:
+                    raw_final_text = block.text
+                    preview = txt[:240].replace("\n", " ")
+                    log.info('%s  text: %s%s', pfx, preview,
+                             '...' if len(txt) > 240 else '')
+            elif btype in ("server_tool_use", "web_search_tool_use", "web_fetch_tool_use"):
+                # Anthropic-dispatched server tool. Log so we know it ran.
+                tname = getattr(block, "name", "server_tool")
+                tin = getattr(block, "input", None) or {}
+                log.info('%s  → [server] %s(%s)', pfx, tname, _short(tin))
+            elif btype in ("web_search_tool_result", "web_fetch_tool_result"):
+                # Result of a server tool — Anthropic already executed it.
+                # Log size if we can.
+                content = getattr(block, "content", None)
+                csize = (len(json.dumps(content, default=str))
+                         if content is not None else 0)
+                log.info('%s  ← [server] result %dB', pfx, csize)
 
         if stop_reason == "end_turn":
-            # Agent says it's done. Try to parse audit.
+            log.info('%send_turn at turn=%d', pfx, turns)
             break
 
         if stop_reason != "tool_use":
-            # Unexpected stop (max_tokens, refusal, etc.)
-            errors.append(f"unexpected stop_reason '{stop_reason}' at turn {turns}")
+            msg = f"unexpected stop_reason '{stop_reason}' at turn {turns}"
+            errors.append(msg)
+            log.warning('%s%s', pfx, msg)
             break
 
         # Run all CLIENT tool_use blocks. Server tools (web_search, web_fetch)
@@ -156,9 +191,6 @@ def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
                 continue
             name = block.name
             if name in SERVER_TOOL_NAMES:
-                # Defensive: should never happen (server tools don't show up
-                # as plain "tool_use"), but skip cleanly if Anthropic ever
-                # changes the routing.
                 continue
             tinput = block.input or {}
 
@@ -167,6 +199,8 @@ def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
                 result = dispatch_tool(name, tinput)
             except Exception as e:
                 result = {"error": f"dispatch crash {type(e).__name__}: {e}"}
+                log.error('%s  dispatch crash %s: %s\n%s', pfx, name, e,
+                          traceback.format_exc())
             elapsed_ms = int((time.time() - t0) * 1000)
 
             # Truncate huge results to keep context tractable
@@ -177,15 +211,23 @@ def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
                     + f'... [truncated {len(result_str) - MAX_TOOL_RESULT_BYTES} bytes]'
                 )
 
+            had_error = "error" in (result if isinstance(result, dict) else {})
             tool_call_log.append({
                 "turn": turns, "name": name,
                 "input_keys": list(tinput.keys()),
                 "input_preview": _short(tinput),
                 "ms": elapsed_ms,
                 "result_size": len(result_str),
-                "had_error": "error" in (result if isinstance(result, dict) else {}),
+                "had_error": had_error,
             })
 
+            log_method = log.error if had_error else log.info
+            log_method('%s  → %s(%s) %dms %dB%s',
+                       pfx, name, _short(tinput), elapsed_ms, len(result_str),
+                       ' ERROR' if had_error else '')
+            if had_error:
+                err_msg = (result.get("error") if isinstance(result, dict) else "?")
+                log.error('%s    error: %s', pfx, err_msg)
             if verbose:
                 print(f"  → {name}({_short(tinput)}) "
                       f"[{elapsed_ms}ms, {len(result_str)}B]", flush=True)
@@ -197,15 +239,29 @@ def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
             })
 
         if not tool_result_blocks:
-            errors.append(f"stop_reason=tool_use but no tool_use blocks turn {turns}")
+            msg = f"stop_reason=tool_use but no client tool_use blocks turn {turns}"
+            errors.append(msg)
+            log.warning('%s%s', pfx, msg)
             break
 
         messages.append({"role": "user", "content": tool_result_blocks})
 
     else:
-        errors.append(f"hit MAX_AGENT_TURNS={MAX_AGENT_TURNS}")
+        msg = f"hit MAX_AGENT_TURNS={MAX_AGENT_TURNS}"
+        errors.append(msg)
+        log.warning('%s%s', pfx, msg)
 
     audit = _extract_audit_json(raw_final_text, errors)
+    if audit is not None:
+        log.info('%sextracted audit JSON (%d top-level keys, %dB raw)',
+                 pfx, len(audit), len(json.dumps(audit, default=str)))
+    else:
+        log.error('%sfailed to extract audit JSON. raw_final_text len=%d preview=%s',
+                  pfx, len(raw_final_text), raw_final_text[:300].replace('\n', ' \\n '))
+
+    log.info('%sloop done turns=%d stop=%s tokens=%d+%d errors=%d',
+             pfx, turns, stop_reason, input_tokens_total, output_tokens_total,
+             len(errors))
 
     return {
         "audit": audit,
@@ -297,7 +353,8 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     if verbose:
         print(f"[agent] starting audit {audit_id} for {url}", flush=True)
 
-    loop_result = run_agent_loop(url, verbose=verbose)
+    loop_result = run_agent_loop(url, verbose=verbose,
+                                  log_prefix=f'[{audit_id[:8]}] ')
 
     audit = loop_result.get("audit")
 

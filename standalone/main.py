@@ -25,13 +25,38 @@ ENVIRONMENT VARIABLES
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
+import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
+
+
+# ----------------------------------------------------------------------
+# LOGGING — configured early so all modules picking up loggers inherit it
+# ----------------------------------------------------------------------
+
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    datefmt='%H:%M:%S',
+    stream=sys.stdout,
+    force=True,
+)
+log = logging.getLogger('audit')
+
+# Quiet down noisy third-party loggers unless we asked for DEBUG
+if LOG_LEVEL != 'DEBUG':
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('anthropic').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 # Load .env if present (graceful fallback if python-dotenv not installed)
 try:
@@ -141,6 +166,32 @@ app = FastAPI(
                 'Powered by 12,764-entry Sieve brain + Anthropic Sonnet 4.6.',
     version='4.0',
 )
+
+
+@app.middleware('http')
+async def request_logging_middleware(request, call_next):
+    """Log slow or non-2xx HTTP responses. Skips the normal 2xx/<1s noise
+    that uvicorn already prints, but always surfaces server errors and
+    audit-related calls (which can be slow)."""
+    t0 = time.time()
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        log.exception('request crashed: %s %s in %dms: %s',
+                      request.method, request.url.path, elapsed_ms, e)
+        raise
+    elapsed_ms = int((time.time() - t0) * 1000)
+    code = response.status_code
+    is_audit_path = request.url.path.startswith('/audit')
+    # Log conditions: server error, slow (>2s), or audit-related anomaly (>=400)
+    if code >= 500:
+        log.error('%s %s → %d in %dms', request.method, request.url.path, code, elapsed_ms)
+    elif code >= 400 and is_audit_path:
+        log.warning('%s %s → %d in %dms', request.method, request.url.path, code, elapsed_ms)
+    elif elapsed_ms > 2000:
+        log.info('SLOW %s %s → %d in %dms', request.method, request.url.path, code, elapsed_ms)
+    return response
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -872,6 +923,7 @@ async def submit_audit(req: AuditRequest, background_tasks: BackgroundTasks):
     """
     audit_id = str(uuid.uuid4())
     url_str = str(req.url)
+    log.info('[%s] submitted url=%s mode=%s', audit_id[:8], url_str, AUDIT_MODE)
 
     with JOBS_LOCK:
         JOBS[audit_id] = {
@@ -896,16 +948,28 @@ async def submit_audit(req: AuditRequest, background_tasks: BackgroundTasks):
 
 def _run_audit_background(audit_id: str, url: str):
     """Background runner — invoked via FastAPI background_tasks."""
+    sid = audit_id[:8]
+    started = time.time()
+    log.info('[%s] mode=%s dispatching url=%s', sid, AUDIT_MODE, url)
+
     with JOBS_LOCK:
         JOBS[audit_id]['status'] = 'running'
         JOBS[audit_id]['started_at'] = datetime.now(timezone.utc).isoformat()
 
     try:
         result = run_audit(url, output_dir=str(OUTPUT_DIR))
+        elapsed = round(time.time() - started, 1)
+
         # Agent path returns an error envelope (no exception) when it can't
         # produce a valid audit JSON. Detect that and mark as error so the
         # homepage doesn't think the audit succeeded.
         if isinstance(result, dict) and result.get('error'):
+            log.error('[%s] failed in %ss: %s', sid, elapsed, result['error'])
+            for ae in (result.get('agent_errors') or [])[:5]:
+                log.error('[%s]   agent_error: %s', sid, ae)
+            preview = (result.get('raw_final_text_preview') or '')[:300]
+            if preview:
+                log.error('[%s]   last_text_preview: %s', sid, preview.replace('\n', ' \\n '))
             with JOBS_LOCK:
                 JOBS[audit_id]['status'] = 'error'
                 JOBS[audit_id]['error'] = result['error']
@@ -917,14 +981,24 @@ def _run_audit_background(audit_id: str, url: str):
                 JOBS[audit_id]['output_tokens'] = result.get('output_tokens')
                 JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
             return
+
+        score = (result.get('scoring') or {}).get('overall_score') if isinstance(result, dict) else None
+        grade = (result.get('scoring') or {}).get('overall_grade') if isinstance(result, dict) else None
+        log.info('[%s] completed in %ss score=%s grade=%s', sid, elapsed, score, grade)
         with JOBS_LOCK:
             JOBS[audit_id]['status'] = 'completed'
             JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
             JOBS[audit_id]['result'] = result
     except Exception as e:
+        elapsed = round(time.time() - started, 1)
+        # Full traceback to stdout — Railway captures it in the log viewer.
+        log.error('[%s] background task crashed in %ss: %s: %s',
+                  sid, elapsed, type(e).__name__, e)
+        log.error('[%s] traceback:\n%s', sid, traceback.format_exc())
         with JOBS_LOCK:
             JOBS[audit_id]['status'] = 'error'
             JOBS[audit_id]['error'] = f'{type(e).__name__}: {e}'
+            JOBS[audit_id]['traceback'] = traceback.format_exc()
             JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
 
 
