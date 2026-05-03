@@ -43,13 +43,9 @@ except ImportError:
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Path as FPath
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, HttpUrl
-
-# UUID-shaped path constraint — prevents /audit/{id} from greedily matching
-# /audit/{id}.md and similar variants
-UUID_RX = r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
 
 from audit_pipeline import run_audit
 
@@ -198,7 +194,7 @@ def _run_audit_background(audit_id: str, url: str):
 
 
 @app.get('/audit/{audit_id}', response_model=AuditStatusResponse)
-def get_audit(audit_id: str = FPath(..., regex=UUID_RX)):
+def get_audit(audit_id: str):
     """Fetch audit status + summary. Poll until status == 'completed'."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
@@ -234,15 +230,17 @@ def get_audit(audit_id: str = FPath(..., regex=UUID_RX)):
         }
 
         response['artifacts'] = {
-            'json': f'/audit/{audit_id}.json',
-            'markdown': f'/audit/{audit_id}.md',
-            'pdf': f'/audit/{audit_id}.pdf',
+            'json': f'/audit/{audit_id}/json',
+            'markdown': f'/audit/{audit_id}/md',
+            'pdf': f'/audit/{audit_id}/pdf',
         }
 
     return response
 
 
-@app.get('/audit/{audit_id}.json')
+# Artifact endpoints use /audit/{id}/{format} (slash separator) to avoid
+# greedy-matching with the bare /audit/{id} route.
+@app.get('/audit/{audit_id}/json')
 def get_audit_json(audit_id: str):
     """Full audit JSON."""
     with JOBS_LOCK:
@@ -256,7 +254,7 @@ def get_audit_json(audit_id: str):
                          filename=f'{audit_id}.json')
 
 
-@app.get('/audit/{audit_id}.md')
+@app.get('/audit/{audit_id}/md')
 def get_audit_markdown(audit_id: str):
     """Markdown audit report."""
     with JOBS_LOCK:
@@ -270,7 +268,7 @@ def get_audit_markdown(audit_id: str):
                          filename=f'{audit_id}.md')
 
 
-@app.get('/audit/{audit_id}.pdf')
+@app.get('/audit/{audit_id}/pdf')
 def get_audit_pdf(audit_id: str):
     """1-page PDF summary."""
     with JOBS_LOCK:
