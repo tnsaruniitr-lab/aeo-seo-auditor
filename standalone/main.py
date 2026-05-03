@@ -121,6 +121,14 @@ class AuditStatusResponse(BaseModel):
     error: Optional[str] = None
     result_summary: Optional[dict] = None
     artifacts: Optional[dict] = None
+    # Agent diagnostic fields — populated when status == 'error' and the
+    # failure originated in the agent loop (vs an exception at orchestration).
+    agent_errors: Optional[list] = None
+    raw_final_text_preview: Optional[str] = None
+    agent_turns: Optional[int] = None
+    tool_call_count: Optional[int] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
 
 
 # ----------------------------------------------------------------------
@@ -450,7 +458,19 @@ async function poll(id) {
       return;
     }
     if (data.status === 'error') {
-      out.innerHTML = renderError(data.error || 'unknown error');
+      let msg = data.error || 'unknown error';
+      if (data.agent_errors && data.agent_errors.length) {
+        msg += '\n\nAgent errors:\n  - ' + data.agent_errors.join('\n  - ');
+      }
+      if (data.raw_final_text_preview) {
+        msg += '\n\nLast assistant text (preview):\n' + data.raw_final_text_preview.slice(0, 800);
+      }
+      const stats = [];
+      if (data.agent_turns != null) stats.push(data.agent_turns + ' turns');
+      if (data.tool_call_count != null) stats.push(data.tool_call_count + ' tool calls');
+      if (data.input_tokens != null) stats.push((data.input_tokens + (data.output_tokens||0)) + ' tokens');
+      if (stats.length) msg += '\n\nAgent stats: ' + stats.join(' · ');
+      out.innerHTML = renderError(msg);
       return;
     }
 
@@ -882,6 +902,21 @@ def _run_audit_background(audit_id: str, url: str):
 
     try:
         result = run_audit(url, output_dir=str(OUTPUT_DIR))
+        # Agent path returns an error envelope (no exception) when it can't
+        # produce a valid audit JSON. Detect that and mark as error so the
+        # homepage doesn't think the audit succeeded.
+        if isinstance(result, dict) and result.get('error'):
+            with JOBS_LOCK:
+                JOBS[audit_id]['status'] = 'error'
+                JOBS[audit_id]['error'] = result['error']
+                JOBS[audit_id]['agent_errors'] = result.get('agent_errors', [])
+                JOBS[audit_id]['raw_final_text_preview'] = result.get('raw_final_text_preview', '')
+                JOBS[audit_id]['agent_turns'] = result.get('agent_turns')
+                JOBS[audit_id]['tool_call_count'] = result.get('tool_call_count')
+                JOBS[audit_id]['input_tokens'] = result.get('input_tokens')
+                JOBS[audit_id]['output_tokens'] = result.get('output_tokens')
+                JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
+            return
         with JOBS_LOCK:
             JOBS[audit_id]['status'] = 'completed'
             JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
@@ -910,6 +945,13 @@ def get_audit(audit_id: str):
 
     if job['status'] == 'error':
         response['error'] = job.get('error')
+        # Surface agent diagnostic fields if present (set by _run_audit_background
+        # when the agent returned an error envelope). These are critical for
+        # debugging why the agent failed to produce valid output.
+        for k in ('agent_errors', 'raw_final_text_preview', 'agent_turns',
+                  'tool_call_count', 'input_tokens', 'output_tokens'):
+            if k in job:
+                response[k] = job[k]
         return response
 
     if job['status'] == 'completed' and job.get('result'):
