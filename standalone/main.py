@@ -44,7 +44,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from pydantic import BaseModel, HttpUrl
 
 from audit_pipeline import run_audit
@@ -101,15 +101,174 @@ app = FastAPI(
 )
 
 
-@app.get('/')
+INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AEO/SEO/GEO Auditor</title>
+<style>
+  :root { --bg:#0b0d10; --panel:#14181d; --border:#262c33; --fg:#e7ecf2; --muted:#8a95a3; --accent:#6ea8ff; --good:#3ecf8e; --warn:#f5b14b; --bad:#ef6464; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 48px 20px; }
+  h1 { font-size: 28px; margin: 0 0 6px; letter-spacing:-0.01em; }
+  .sub { color: var(--muted); margin-bottom: 32px; }
+  form { display:flex; gap:8px; margin-bottom:24px; }
+  input[type=url] { flex:1; background:var(--panel); border:1px solid var(--border); color:var(--fg); padding:14px 16px; border-radius:8px; font-size:15px; outline:none; }
+  input[type=url]:focus { border-color: var(--accent); }
+  button { background:var(--accent); color:#0b0d10; border:0; padding:14px 22px; border-radius:8px; font-weight:600; cursor:pointer; font-size:15px; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px; margin-top:16px; }
+  .row { display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  .score { font-size: 48px; font-weight:700; letter-spacing:-0.02em; }
+  .grade { font-size: 28px; font-weight:600; padding:4px 14px; border-radius:8px; background:#222; }
+  .grade.A { background:#13402c; color:var(--good); }
+  .grade.B { background:#13402c; color:var(--good); }
+  .grade.C { background:#403213; color:var(--warn); }
+  .grade.D, .grade.F { background:#401818; color:var(--bad); }
+  .meta { color:var(--muted); font-size:13px; }
+  .sections { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; margin-top:16px; }
+  .sec { background:#0b0d10; border:1px solid var(--border); padding:10px 12px; border-radius:6px; }
+  .sec .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:0.04em; }
+  .sec .v { font-size:18px; font-weight:600; margin-top:2px; }
+  .diag { white-space:pre-wrap; line-height:1.65; }
+  .links { display:flex; gap:8px; margin-top:18px; flex-wrap:wrap; }
+  .links a { background:#0b0d10; border:1px solid var(--border); color:var(--fg); text-decoration:none; padding:10px 14px; border-radius:6px; font-size:13px; }
+  .links a:hover { border-color: var(--accent); color:var(--accent); }
+  .status { display:inline-block; padding:3px 10px; border-radius:999px; font-size:12px; background:#1d2530; color:var(--accent); }
+  .status.error { background:#401818; color:var(--bad); }
+  .err { color:var(--bad); white-space:pre-wrap; font-family:ui-monospace,monospace; font-size:13px; }
+  .spinner { display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle; margin-right:6px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  footer { color:var(--muted); font-size:12px; margin-top:40px; text-align:center; }
+  footer a { color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AEO / SEO / GEO Auditor</h1>
+  <div class="sub">Deterministic 97-check audit · Sieve brain (12,764 entries) · Claude Sonnet 4.6</div>
+
+  <form id="f">
+    <input id="url" type="url" placeholder="https://example.com" required autofocus>
+    <button id="go" type="submit">Run audit</button>
+  </form>
+
+  <div id="out"></div>
+
+  <footer>
+    JSON API: <a href="/api">/api</a> · Health: <a href="/healthz">/healthz</a> · Docs: <a href="/docs">/docs</a>
+  </footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const out = $('out');
+
+$('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const url = $('url').value.trim();
+  if (!url) return;
+  $('go').disabled = true;
+  out.innerHTML = '<div class="panel"><span class="status"><span class="spinner"></span>Submitting…</span></div>';
+
+  try {
+    const r = await fetch('/audit', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url})
+    });
+    if (!r.ok) throw new Error('Submit failed: ' + r.status + ' ' + (await r.text()));
+    const {audit_id} = await r.json();
+    await poll(audit_id);
+  } catch (err) {
+    out.innerHTML = '<div class="panel"><div class="status error">Error</div><div class="err" style="margin-top:10px">' + escapeHtml(err.message) + '</div></div>';
+  } finally {
+    $('go').disabled = false;
+  }
+});
+
+async function poll(id) {
+  const started = Date.now();
+  while (true) {
+    const r = await fetch('/audit/' + id);
+    const data = await r.json();
+    const elapsed = Math.round((Date.now() - started) / 1000);
+
+    if (data.status === 'completed') { render(data); return; }
+    if (data.status === 'error') {
+      out.innerHTML = '<div class="panel"><div class="status error">Audit failed</div><div class="err" style="margin-top:10px">' + escapeHtml(data.error || 'unknown error') + '</div></div>';
+      return;
+    }
+    out.innerHTML = '<div class="panel"><span class="status"><span class="spinner"></span>' +
+      (data.status === 'queued' ? 'Queued' : 'Running') + ' · ' + elapsed + 's elapsed</span>' +
+      '<div class="meta" style="margin-top:8px">Typical completion: 60–120 seconds. Running 97 checks across Technical, Performance, On-Page, Schema, AEO, GEO, Entity.</div></div>';
+    await new Promise(r => setTimeout(r, 3000));
+  }
+}
+
+function render(data) {
+  const s = data.result_summary || {};
+  const sec = s.section_scores || {};
+  const grade = (s.overall_grade || '').charAt(0).toUpperCase();
+  const a = data.artifacts || {};
+  const id = data.audit_id;
+
+  let secHtml = '';
+  for (const [k, v] of Object.entries(sec)) {
+    secHtml += '<div class="sec"><div class="k">' + escapeHtml(k) + '</div><div class="v">' + escapeHtml(String(v ?? '—')) + '</div></div>';
+  }
+
+  out.innerHTML =
+    '<div class="panel">' +
+      '<div class="row">' +
+        '<div>' +
+          '<div class="meta">' + escapeHtml(s.url || '') + '</div>' +
+          '<div class="meta">' + escapeHtml(s.page_type || '—') + ' · ' + escapeHtml(s.industry || '—') + ' · ' + (data.duration_seconds || '?') + 's · ' + (s.findings_count || 0) + ' findings</div>' +
+        '</div>' +
+        '<div style="display:flex;align-items:center;gap:12px">' +
+          '<div class="score">' + (s.overall_score ?? '—') + '</div>' +
+          '<div class="grade ' + escapeHtml(grade) + '">' + escapeHtml(s.overall_grade || '—') + '</div>' +
+        '</div>' +
+      '</div>' +
+      (secHtml ? '<div class="sections">' + secHtml + '</div>' : '') +
+    '</div>' +
+
+    (s.executive_diagnosis ? '<div class="panel"><h3 style="margin:0 0 12px;font-size:15px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em">Executive diagnosis</h3><div class="diag">' + escapeHtml(s.executive_diagnosis) + '</div></div>' : '') +
+
+    '<div class="panel"><h3 style="margin:0 0 12px;font-size:15px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em">Download artifacts</h3>' +
+      '<div class="links">' +
+        '<a href="' + (a.json || '/audit/'+id+'/json') + '" target="_blank">Full JSON</a>' +
+        '<a href="' + (a.markdown || '/audit/'+id+'/md') + '" target="_blank">Markdown report</a>' +
+        '<a href="' + (a.pdf || '/audit/'+id+'/pdf') + '" target="_blank">PDF summary</a>' +
+      '</div>' +
+    '</div>';
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+</script>
+</body>
+</html>
+"""
+
+
+@app.get('/', response_class=HTMLResponse)
 def root():
+    return HTMLResponse(INDEX_HTML)
+
+
+@app.get('/api')
+def api_info():
     return {
         'service': 'aeo-seo-auditor',
         'version': '4.0',
         'endpoints': {
             'POST /audit': 'Submit a URL for audit',
             'GET /audit/{id}': 'Fetch status + result',
-            'GET /audit/{id}.{json,md,pdf}': 'Fetch specific artifact',
+            'GET /audit/{id}/{json,md,pdf}': 'Fetch specific artifact',
             'GET /healthz': 'Health check',
         },
         'docs': '/docs',
