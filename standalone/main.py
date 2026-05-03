@@ -43,9 +43,13 @@ except ImportError:
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Path as FPath
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, HttpUrl
+
+# UUID-shaped path constraint — prevents /audit/{id} from greedily matching
+# /audit/{id}.md and similar variants
+UUID_RX = r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
 
 from audit_pipeline import run_audit
 
@@ -194,7 +198,7 @@ def _run_audit_background(audit_id: str, url: str):
 
 
 @app.get('/audit/{audit_id}', response_model=AuditStatusResponse)
-def get_audit(audit_id: str):
+def get_audit(audit_id: str = FPath(..., regex=UUID_RX)):
     """Fetch audit status + summary. Poll until status == 'completed'."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
