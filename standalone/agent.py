@@ -1,0 +1,423 @@
+"""
+agent.py — Audit agent harness.
+
+Runs the 15-phase playbook in `system_prompt.py` as a Claude tool-use loop.
+The agent calls tools defined in tools.py until it emits a final
+`<audit>...</audit>` JSON payload.
+
+This is the parity layer: same model (claude-sonnet-4-6), same playbook
+(skill-unified/SKILL.md adaptation), same tools (web_fetch, web_search,
+Playwright render, deterministic scripts, brain ranker, references) as the
+chat skill — just headless.
+
+USAGE
+    from agent import run_audit_agent
+    result = run_audit_agent("https://example.com", output_dir="./audits/")
+
+ENV
+    ANTHROPIC_API_KEY     required
+    TAVILY_API_KEY        required for web_search
+    SUPABASE_URL/KEY      optional for persist_audit
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+THIS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(THIS_DIR))
+
+from tools import TOOLS_SPEC, dispatch_tool
+from system_prompt import SYSTEM_PROMPT
+
+
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+
+MODEL = "claude-sonnet-4-6"
+MAX_TOKENS_PER_TURN = 8192
+MAX_AGENT_TURNS = 80              # hard cap on tool-use iterations
+MAX_TOOL_RESULT_BYTES = 50_000     # truncate big tool outputs (e.g. raw scripts JSON)
+TOTAL_BUDGET_SECONDS = 480         # 8-minute hard ceiling per audit
+
+
+# -----------------------------------------------------------------------------
+# CORE LOOP
+# -----------------------------------------------------------------------------
+
+def run_agent_loop(url: str, verbose: bool = False) -> Dict[str, Any]:
+    """Drive the Claude tool-use loop until the agent emits <audit>...</audit>.
+
+    Returns:
+        {
+          "audit": dict | None,        # parsed audit JSON
+          "raw_final_text": str,       # last assistant text (for debugging)
+          "tool_calls": [...],         # log of (name, input_summary, ms)
+          "turns": int,
+          "stop_reason": str,
+          "input_tokens": int,
+          "output_tokens": int,
+          "errors": [str],
+        }
+    """
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        return _fail("anthropic SDK not installed")
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return _fail("ANTHROPIC_API_KEY not set")
+
+    client = Anthropic(api_key=api_key)
+
+    messages: List[Dict[str, Any]] = [{
+        "role": "user",
+        "content": (
+            f"Audit this URL: {url}\n\n"
+            "Execute all 15 phases in order. Use the tools as specified. "
+            "When finished, your FINAL message must be ONLY a single JSON "
+            "object wrapped in <audit>...</audit> tags."
+        ),
+    }]
+
+    tool_call_log: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    input_tokens_total = 0
+    output_tokens_total = 0
+    raw_final_text = ""
+    stop_reason = "unknown"
+    turns = 0
+
+    started = time.time()
+
+    for turn in range(MAX_AGENT_TURNS):
+        turns = turn + 1
+
+        if time.time() - started > TOTAL_BUDGET_SECONDS:
+            errors.append(f"hit total budget {TOTAL_BUDGET_SECONDS}s at turn {turns}")
+            break
+
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS_PER_TURN,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS_SPEC,
+                messages=messages,
+            )
+        except Exception as e:
+            errors.append(f"messages.create failed turn {turns}: "
+                          f"{type(e).__name__}: {e}")
+            break
+
+        input_tokens_total += response.usage.input_tokens
+        output_tokens_total += response.usage.output_tokens
+        stop_reason = response.stop_reason
+
+        if verbose:
+            print(f"[turn {turns}] stop={stop_reason} "
+                  f"in={response.usage.input_tokens} "
+                  f"out={response.usage.output_tokens}", flush=True)
+
+        # Append assistant turn (includes text + tool_use blocks)
+        messages.append({"role": "assistant", "content": response.content})
+
+        # Capture latest assistant text in case this is the end
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                raw_final_text = block.text or raw_final_text
+
+        if stop_reason == "end_turn":
+            # Agent says it's done. Try to parse audit.
+            break
+
+        if stop_reason != "tool_use":
+            # Unexpected stop (max_tokens, refusal, etc.)
+            errors.append(f"unexpected stop_reason '{stop_reason}' at turn {turns}")
+            break
+
+        # Run all tool_use blocks in this turn, collect tool_result blocks
+        tool_result_blocks: List[Dict[str, Any]] = []
+        for block in response.content:
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            name = block.name
+            tinput = block.input or {}
+
+            t0 = time.time()
+            try:
+                result = dispatch_tool(name, tinput)
+            except Exception as e:
+                result = {"error": f"dispatch crash {type(e).__name__}: {e}"}
+            elapsed_ms = int((time.time() - t0) * 1000)
+
+            # Truncate huge results to keep context tractable
+            result_str = json.dumps(result, default=str, ensure_ascii=False)
+            if len(result_str) > MAX_TOOL_RESULT_BYTES:
+                result_str = (
+                    result_str[:MAX_TOOL_RESULT_BYTES]
+                    + f'... [truncated {len(result_str) - MAX_TOOL_RESULT_BYTES} bytes]'
+                )
+
+            tool_call_log.append({
+                "turn": turns, "name": name,
+                "input_keys": list(tinput.keys()),
+                "input_preview": _short(tinput),
+                "ms": elapsed_ms,
+                "result_size": len(result_str),
+                "had_error": "error" in (result if isinstance(result, dict) else {}),
+            })
+
+            if verbose:
+                print(f"  → {name}({_short(tinput)}) "
+                      f"[{elapsed_ms}ms, {len(result_str)}B]", flush=True)
+
+            tool_result_blocks.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result_str,
+            })
+
+        if not tool_result_blocks:
+            errors.append(f"stop_reason=tool_use but no tool_use blocks turn {turns}")
+            break
+
+        messages.append({"role": "user", "content": tool_result_blocks})
+
+    else:
+        errors.append(f"hit MAX_AGENT_TURNS={MAX_AGENT_TURNS}")
+
+    audit = _extract_audit_json(raw_final_text, errors)
+
+    return {
+        "audit": audit,
+        "raw_final_text": raw_final_text[:5000],
+        "tool_calls": tool_call_log,
+        "turns": turns,
+        "stop_reason": stop_reason,
+        "input_tokens": input_tokens_total,
+        "output_tokens": output_tokens_total,
+        "errors": errors,
+        "duration_seconds": round(time.time() - started, 1),
+    }
+
+
+# -----------------------------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------------------------
+
+def _fail(msg: str) -> Dict[str, Any]:
+    return {
+        "audit": None, "raw_final_text": "", "tool_calls": [],
+        "turns": 0, "stop_reason": "error",
+        "input_tokens": 0, "output_tokens": 0,
+        "errors": [msg], "duration_seconds": 0,
+    }
+
+
+def _short(d: Dict[str, Any], max_len: int = 80) -> str:
+    s = json.dumps(d, default=str, ensure_ascii=False)
+    return s[:max_len] + ("..." if len(s) > max_len else "")
+
+
+_AUDIT_TAG_RE = re.compile(r"<audit>\s*(\{.*?\})\s*</audit>", re.DOTALL)
+
+
+def _extract_audit_json(text: str, errors: List[str]) -> Optional[Dict[str, Any]]:
+    """Pull the JSON object from the final assistant text. Robust to:
+       - <audit>{...}</audit> tags (preferred)
+       - bare {...} JSON if tags missing
+       - markdown ```json fences
+    """
+    if not text:
+        errors.append("no final text to parse")
+        return None
+
+    m = _AUDIT_TAG_RE.search(text)
+    candidate = m.group(1) if m else None
+
+    if candidate is None:
+        # Fallback 1: strip ```json fences
+        stripped = re.sub(r"^```(?:json)?\s*", "", text.strip())
+        stripped = re.sub(r"\s*```\s*$", "", stripped)
+        if stripped.startswith("{") and stripped.endswith("}"):
+            candidate = stripped
+
+    if candidate is None:
+        # Fallback 2: first {...} block in text
+        brace_match = re.search(r"\{[\s\S]*\}", text)
+        if brace_match:
+            candidate = brace_match.group(0)
+
+    if candidate is None:
+        errors.append("no JSON object found in final text")
+        return None
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as e:
+        errors.append(f"final JSON parse failed: {e}")
+        return None
+
+
+# -----------------------------------------------------------------------------
+# PUBLIC ENTRYPOINT — analog of audit_pipeline.run_audit()
+# -----------------------------------------------------------------------------
+
+def run_audit_agent(url: str, output_dir: str = "./audits/",
+                     verbose: bool = False) -> Dict[str, Any]:
+    """Run the agent loop, attach metadata, render artifacts, return result.
+
+    Output shape matches the existing `run_audit()` from audit_pipeline.py so
+    main.py and the rest of the FastAPI service work without changes.
+    """
+    audit_id = str(uuid.uuid4())
+    started = time.time()
+    out_dir = Path(output_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print(f"[agent] starting audit {audit_id} for {url}", flush=True)
+
+    loop_result = run_agent_loop(url, verbose=verbose)
+
+    audit = loop_result.get("audit")
+
+    domain = re.sub(r"^https?://", "", url).rstrip("/").split("/")[0]
+    duration = round(time.time() - started, 1)
+
+    # Build the wrapped result regardless of agent success
+    if audit is None:
+        # Agent failed to produce parseable output. Return error envelope.
+        return {
+            "audit_id": audit_id,
+            "url": url,
+            "domain": domain,
+            "duration_seconds": duration,
+            "error": "agent did not return valid audit JSON",
+            "agent_errors": loop_result.get("errors", []),
+            "agent_turns": loop_result.get("turns"),
+            "agent_stop_reason": loop_result.get("stop_reason"),
+            "raw_final_text_preview": loop_result.get("raw_final_text", "")[:1500],
+            "tool_call_count": len(loop_result.get("tool_calls", [])),
+            "input_tokens": loop_result.get("input_tokens"),
+            "output_tokens": loop_result.get("output_tokens"),
+        }
+
+    # Inject our authoritative metadata into the agent's audit
+    audit["audit_id"] = audit_id
+    audit["url"] = url
+    audit["domain"] = domain
+    audit["date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    audit["duration_seconds"] = duration
+
+    md = audit.setdefault("metadata", {})
+    md["version"] = md.get("version", "5.0-agent")
+    md["model"] = MODEL
+    md["tool_call_count"] = len(loop_result.get("tool_calls", []))
+    md["agent_turns"] = loop_result.get("turns")
+    md["agent_stop_reason"] = loop_result.get("stop_reason")
+    md["input_tokens"] = loop_result.get("input_tokens")
+    md["output_tokens"] = loop_result.get("output_tokens")
+    md["agent_errors"] = loop_result.get("errors", [])
+
+    # Render artifacts using the existing renderers from audit_pipeline.py
+    # (they consume the same shape we produce).
+    try:
+        from audit_pipeline import render_markdown_report, render_pdf_summary
+    except ImportError as e:
+        audit["render_warning"] = f"renderers unavailable: {e}"
+        render_markdown_report = None
+        render_pdf_summary = None
+
+    slug = domain.replace(".", "-")
+    base_path = out_dir / f"{slug}-{audit_id[:8]}"
+
+    json_path = base_path.with_suffix(".json")
+    json_path.write_text(json.dumps(audit, indent=2, ensure_ascii=False, default=str))
+    audit["json_path"] = str(json_path)
+
+    if render_markdown_report:
+        try:
+            md_text = render_markdown_report(_render_compat(audit))
+            md_path = base_path.with_suffix(".md")
+            md_path.write_text(md_text)
+            audit["md_path"] = str(md_path)
+        except Exception as e:
+            audit["md_render_error"] = f"{type(e).__name__}: {e}"
+            audit["md_path"] = None
+    else:
+        audit["md_path"] = None
+
+    if render_pdf_summary:
+        try:
+            pdf_path = render_pdf_summary(_render_compat(audit), base_path)
+            audit["pdf_path"] = str(pdf_path) if pdf_path else None
+        except Exception as e:
+            audit["pdf_render_error"] = f"{type(e).__name__}: {e}"
+            audit["pdf_path"] = None
+    else:
+        audit["pdf_path"] = None
+
+    if verbose:
+        print(f"[agent] complete in {duration}s, "
+              f"{md['tool_call_count']} tool calls, "
+              f"{md['input_tokens']}+{md['output_tokens']} tokens",
+              flush=True)
+
+    return audit
+
+
+def _render_compat(audit: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapt the agent's audit shape to what render_markdown_report expects.
+
+    The legacy renderer wants: scripts_output, brain_stats, classification,
+    scoring, narrative, findings. The agent produces the same fields, but
+    'scripts_output' is nested under bots_eye_view differently. Stitch them.
+    """
+    return {
+        "audit_id": audit.get("audit_id"),
+        "url": audit.get("url"),
+        "domain": audit.get("domain"),
+        "date": audit.get("date"),
+        "duration_seconds": audit.get("duration_seconds"),
+        "classification": audit.get("classification", {}),
+        "scoring": audit.get("scoring", {}),
+        "findings": audit.get("findings", []),
+        "narrative": audit.get("narrative", {}),
+        "scripts_output": {
+            "bots_eye_view": audit.get("bots_eye_view", {}),
+            "all_checks": {f["check_id"]: f for f in audit.get("findings", [])},
+        },
+        "brain_stats": audit.get("metadata", {}).get("brain_stats", {}),
+    }
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser(description="Run the agent-mode audit pipeline.")
+    p.add_argument("url")
+    p.add_argument("--output", "-o", default="./audits/")
+    p.add_argument("--verbose", "-v", action="store_true")
+    args = p.parse_args()
+
+    result = run_audit_agent(args.url, args.output, verbose=args.verbose)
+    print(json.dumps({k: v for k, v in result.items()
+                      if k not in ("findings", "scripts_output", "bots_eye_view")},
+                     indent=2, ensure_ascii=False, default=str)[:5000])
+    if result.get("error"):
+        sys.exit(1)

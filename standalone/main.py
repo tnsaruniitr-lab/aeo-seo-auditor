@@ -47,7 +47,41 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from pydantic import BaseModel, HttpUrl
 
-from audit_pipeline import run_audit
+from audit_pipeline import run_audit as run_audit_deterministic
+
+# Agent-mode (full parity with the chat skill) is opt-in via AUDIT_MODE env var.
+# Default is "agent" once the parity layer is deployed; falls back automatically
+# if dependencies (Playwright, Tavily key, etc.) aren't ready.
+AUDIT_MODE = os.getenv('AUDIT_MODE', 'agent').lower().strip()
+
+try:
+    from agent import run_audit_agent
+    AGENT_AVAILABLE = True
+except Exception as _agent_import_err:
+    AGENT_AVAILABLE = False
+    _AGENT_IMPORT_ERROR = str(_agent_import_err)
+
+
+def run_audit(url: str, output_dir: str):
+    """Dispatch to the chosen audit pipeline.
+
+    Modes:
+        - 'agent'         : full 15-phase parity loop (matches chat skill)
+        - 'deterministic' : legacy fast path (scripts + 1 Sonnet call)
+        - 'auto'          : agent if available, else deterministic
+    """
+    mode = AUDIT_MODE
+    if mode == 'agent' and not AGENT_AVAILABLE:
+        # Hard-fail if the user explicitly asked for agent and it's broken
+        raise RuntimeError(
+            f"AUDIT_MODE=agent requested but agent module failed to import: "
+            f"{_AGENT_IMPORT_ERROR}"
+        )
+    if mode == 'auto':
+        mode = 'agent' if AGENT_AVAILABLE else 'deterministic'
+    if mode == 'agent':
+        return run_audit_agent(url, output_dir=output_dir, verbose=False)
+    return run_audit_deterministic(url, output_dir=output_dir)
 
 
 # ----------------------------------------------------------------------
@@ -286,11 +320,16 @@ def healthz():
         )
         stats = brain.stats()
         api_key_set = bool(os.getenv('ANTHROPIC_API_KEY'))
+        tavily_key_set = bool(os.getenv('TAVILY_API_KEY'))
         return {
             'status': 'ok',
             'brain_loaded': True,
             'brain_stats': stats,
             'anthropic_key_set': api_key_set,
+            'tavily_key_set': tavily_key_set,
+            'audit_mode': AUDIT_MODE,
+            'agent_available': AGENT_AVAILABLE,
+            'agent_import_error': None if AGENT_AVAILABLE else _AGENT_IMPORT_ERROR,
             'output_dir': str(OUTPUT_DIR),
         }
     except Exception as e:
