@@ -48,7 +48,11 @@ log = logging.getLogger('audit.agent')
 # -----------------------------------------------------------------------------
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS_PER_TURN = 8192
+# Output token cap per turn. The final audit JSON is ~26KB (~7-8K tokens)
+# and intermediate turns are tiny (~200 tokens), so a generous ceiling
+# avoids the "max_tokens cut off the final JSON mid-object" failure mode.
+# Sonnet 4.6 supports up to 64K output tokens.
+MAX_TOKENS_PER_TURN = 32768
 MAX_AGENT_TURNS = 80              # hard cap on tool-use iterations
 MAX_TOOL_RESULT_BYTES = 50_000     # truncate big tool outputs (e.g. raw scripts JSON)
 TOTAL_BUDGET_SECONDS = 480         # 8-minute hard ceiling per audit
