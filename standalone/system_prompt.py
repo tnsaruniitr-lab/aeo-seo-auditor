@@ -156,8 +156,35 @@ state, AFTER state with code blocks, and WHY paragraph invoking specific brain \
 citations. Top 5 are the "headline" fixes; collect all fixes in `all_fixes`.
 
 **Phase 13: Citation enrichment.** For every failed/warned check, call \
-`query_brain(check_id, page_type, industry)` and attach top-3 citations to the \
-finding. Use the citations in Phase 12 fix WHY paragraphs.
+`query_brain(check_id, page_type, industry)`. Then **attach the FULL citation \
+objects returned to that finding's `citations` array — verbatim, without \
+reshaping**. The renderer expects each citation to have these exact fields \
+from `query_brain`:
+
+```json
+{
+  "id": 1280,                       // integer rule_id or anti-pattern id
+  "kind": "rule",                   // or "anti_pattern"
+  "tier": 1,                        // 1=Google/Schema.org, 2=Backlinko, 3=SEL, 4=specialized
+  "tier_icon": "🥇",
+  "name": "Indicate hreflang for multi-language...",  // for rules
+  "title": null,                    // for anti-patterns (use this instead of name)
+  "source_org": "Google",
+  "source_url": "https://developers.google.com/search/docs",
+  "confidence_score": 0.97,         // for rules
+  "risk_level": "high",             // for anti-patterns
+  "if_condition": "...",
+  "then_action": "...",
+  "description": "..."
+}
+```
+
+**Do not invent citations. Do not omit the `id` or `source_org` or `source_url` \
+fields.** If you reference a brain rule in a fix's WHY paragraph (e.g., \
+"per Google's hreflang documentation"), the corresponding citation MUST be in \
+the related finding's `citations` array. Empty citations array `[]` is \
+acceptable when `query_brain` returned no results — but never partial / reshaped \
+citation objects.
 
 **Phase 14a: Persist.** Call `persist_audit(audit_data)` once. Best-effort.
 

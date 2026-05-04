@@ -697,14 +697,22 @@ function renderTwoCol(bev, perf, audit) {
   const pid = bev.page_identity || {};
   const summary = bev.summary || {};
 
+  // Handle multiple possible field-name conventions across agent vs script outputs
+  const faqVisible = cvb.faq_visible_pairs ?? cvb.faq_visible ?? summary.faq_visible ?? bev.faq_visible_pairs;
+  const faqSchema = cvb.faq_schema_pairs ?? cvb.faq_schema ?? summary.faq_schema ?? bev.faq_schema_pairs;
+  const faqStr = (faqVisible !== undefined && faqSchema !== undefined)
+    ? faqVisible + ' / ' + faqSchema
+    : null;
+  const wordCount = cvb.visible_word_count ?? summary.visible_words_default ?? cvb.visible_words ?? bev.visible_word_count;
+
   const bevRows = [
-    ['Visible word count', cvb.visible_word_count || summary.visible_words_default],
-    ['Schema blocks', cvb.schema_block_count],
-    ['FAQ visible / in schema', (cvb.faq_visible_pairs ?? summary.faq_visible) + ' / ' + (cvb.faq_schema_pairs ?? summary.faq_schema)],
-    ['Title', pid.title],
-    ['H1', pid.h1_first],
-    ['Canonical', pid.canonical_tag || 'none'],
-    ['Meta robots', pid.meta_robots || 'none'],
+    ['Visible word count', wordCount],
+    ['Schema blocks', cvb.schema_block_count ?? summary.schema_blocks ?? bev.schema_block_count],
+    ['FAQ visible / in schema', faqStr],
+    ['Title', pid.title || bev.title],
+    ['H1', pid.h1_first || bev.h1_first],
+    ['Canonical', pid.canonical_tag || bev.canonical || 'none'],
+    ['Meta robots', pid.meta_robots || bev.meta_robots || 'none'],
     ['Classification', bev.classification],
   ];
   const perfRows = [
@@ -795,13 +803,19 @@ function renderAllFindings(findings) {
 }
 
 function renderBrainSources(findings) {
-  // Collect unique citations grouped by tier
+  // Collect unique citations grouped by tier. Skip citations that have no
+  // usable content (no name AND no source_org AND no source_url) — those
+  // are the agent emitting partial/reshaped objects.
   const seen = new Set();
   const byTier = {1:[], 2:[], 3:[], 4:[], 5:[]};
   for (const f of findings) {
     for (const c of (f.citations || [])) {
-      if (seen.has(c.id + ':' + c.kind)) continue;
-      seen.add(c.id + ':' + c.kind);
+      const name = c.name || c.title;
+      const hasContent = name || c.source_org || c.source_url;
+      if (!hasContent) continue;  // skip empty/malformed
+      const dedupKey = (c.id ?? name) + ':' + (c.kind || '?');
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
       const tier = c.tier || 5;
       (byTier[tier] = byTier[tier] || []).push(c);
     }
@@ -817,12 +831,19 @@ function renderBrainSources(findings) {
     for (const c of byTier[t].slice(0, 12)) {
       const kind = c.kind === 'rule' ? 'Rule' : c.kind === 'anti_pattern' ? 'AP' : 'Item';
       const name = c.name || c.title || '(no name)';
+      // Confidence/risk badges where available
+      const conf = (c.confidence_score != null) ? ' (conf ' + c.confidence_score + ')' : '';
+      const risk = c.risk_level ? ' [' + escapeHtml(c.risk_level) + ' risk]' : '';
+      // Only show [#id] if id is actually a usable number
+      const idTag = (c.id != null && c.id !== '' && !isNaN(c.id))
+        ? ' <code style="font-size:11px">[Sieve ' + kind + ' #' + escapeHtml(String(c.id)) + ']</code>'
+        : '';
       html += '<div class="citation">' +
         '<span class="src">' + escapeHtml(c.source_org || 'unknown') + '</span> — ' +
         (c.source_url ? '<a href="' + escapeHtml(c.source_url) + '" target="_blank" rel="noopener">' : '') +
         '<span class="nm">' + escapeHtml(name) + '</span>' +
         (c.source_url ? '</a>' : '') +
-        ' <code style="font-size:11px">[Sieve ' + kind + ' #' + escapeHtml(String(c.id)) + ']</code>' +
+        conf + risk + idTag +
         '</div>';
     }
     html += '</div>';
