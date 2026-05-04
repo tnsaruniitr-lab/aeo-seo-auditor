@@ -121,17 +121,23 @@ def run_agent_loop(url: str, verbose: bool = False,
             break
 
         try:
-            response = client.messages.create(
+            # Use streaming so we're not bound by the SDK's non-streaming
+            # 10-minute upper-bound heuristic. With MAX_TOKENS_PER_TURN at
+            # 32768 the SDK refuses non-streaming requests because
+            # 32768 / conservative_token_rate could exceed 600s. Streaming
+            # bypasses this — same response shape, same cost.
+            with client.messages.stream(
                 model=MODEL,
                 max_tokens=MAX_TOKENS_PER_TURN,
                 system=SYSTEM_PROMPT,
                 tools=TOOLS_SPEC,
                 messages=messages,
-            )
+            ) as stream:
+                response = stream.get_final_message()
         except Exception as e:
-            errors.append(f"messages.create failed turn {turns}: "
+            errors.append(f"messages.stream failed turn {turns}: "
                           f"{type(e).__name__}: {e}")
-            log.error('%smessages.create failed turn=%d: %s: %s',
+            log.error('%smessages.stream failed turn=%d: %s: %s',
                       pfx, turns, type(e).__name__, e)
             log.error('%s%s', pfx, traceback.format_exc())
             break
