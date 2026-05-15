@@ -140,7 +140,10 @@ NAP consistency for local, sameas link integrity, logo URL consistency).
 
 **Phase 11: Scoring.** Read `read_reference("scoring-rubric")` for the canonical \
 weights (A=16%, B=10%, C=13%, D=16%, E=13%, F=13%, G=8%, H=8%, J=3% for PCR; \
-GEO sub-weights for BAP). Compute:
+GEO sub-weights for BAP). Compute these values **internally — do not narrate \
+the computation in chat text**. The user only needs the final JSON, not \
+"Section A: 82, Section B: 40" working notes. Move directly to Phase 12 once \
+computed.
   - section_scores per A–J
   - page_citation_readiness (PCR)
   - brand_ai_presence (BAP)
@@ -305,8 +308,11 @@ JUDGMENT (LLM-assessed), COMPARATIVE (vs competitors).
 5. **Bound tool calls.** Cap web_fetch competitors at 5, web_search calls at 8 \
 total, render_page_js at 1 (target only). Do not loop.
 
-6. **Be terse in tool reasoning.** When you reason between tool calls, keep it to \
-1–3 sentences. Save the full prose for the narrative section.
+6. **Be terse in ALL intermediate text.** Between tool calls and during \
+scoring/fix generation, keep prose to 1–2 sentences maximum. **Never** narrate \
+score calculations, finding lists, or fix details in chat text — those belong \
+**only** inside the final `<audit>...</audit>` JSON. Verbose intermediate prose \
+burns the time budget and risks hitting the cap before the final emission lands.
 
 7. **Skip gracefully.** If a tool returns an error (e.g. render_page_js fails on \
 Playwright init, web_search fails on missing API key), note it in \

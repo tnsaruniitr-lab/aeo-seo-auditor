@@ -55,7 +55,12 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS_PER_TURN = 32768
 MAX_AGENT_TURNS = 80              # hard cap on tool-use iterations
 MAX_TOOL_RESULT_BYTES = 50_000     # truncate big tool outputs (e.g. raw scripts JSON)
-TOTAL_BUDGET_SECONDS = 480         # 8-minute hard ceiling per audit
+# Total time budget per audit. Bumped 480s → 900s after excellage.ae
+# hit 480s at turn 8 with all the WORK done (just ran out before the
+# final emission). Slow sites (high TTFB, large pages) make every tool
+# call slower, and competitor crawls amplify this. 900s gives ~50%
+# headroom over the slowest observed audit (~440s).
+TOTAL_BUDGET_SECONDS = 900
 
 
 # -----------------------------------------------------------------------------
