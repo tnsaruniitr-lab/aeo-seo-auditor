@@ -87,13 +87,17 @@ except Exception as _agent_import_err:
     _AGENT_IMPORT_ERROR = str(_agent_import_err)
 
 
-def run_audit(url: str, output_dir: str):
+def run_audit(url: str, output_dir: str, progress_callback=None):
     """Dispatch to the chosen audit pipeline.
 
     Modes:
         - 'agent'         : full 15-phase parity loop (matches chat skill)
         - 'deterministic' : legacy fast path (scripts + 1 Sonnet call)
         - 'auto'          : agent if available, else deterministic
+
+    progress_callback (optional): called with a dict {phase, tool, turn,
+    tool_count, elapsed_seconds, last_tool_ms} after each tool call when
+    running in agent mode. Ignored by the deterministic path.
     """
     mode = AUDIT_MODE
     if mode == 'agent' and not AGENT_AVAILABLE:
@@ -105,7 +109,8 @@ def run_audit(url: str, output_dir: str):
     if mode == 'auto':
         mode = 'agent' if AGENT_AVAILABLE else 'deterministic'
     if mode == 'agent':
-        return run_audit_agent(url, output_dir=output_dir, verbose=False)
+        return run_audit_agent(url, output_dir=output_dir, verbose=False,
+                                progress_callback=progress_callback)
     return run_audit_deterministic(url, output_dir=output_dir)
 
 
@@ -146,6 +151,9 @@ class AuditStatusResponse(BaseModel):
     error: Optional[str] = None
     result_summary: Optional[dict] = None
     artifacts: Optional[dict] = None
+    # Live progress (populated while status == 'running'):
+    # {phase, tool, turn, tool_count, elapsed_seconds, last_tool_ms}
+    progress: Optional[dict] = None
     # Agent diagnostic fields — populated when status == 'error' and the
     # failure originated in the agent loop (vs an exception at orchestration).
     agent_errors: Optional[list] = None
@@ -525,14 +533,24 @@ async function poll(id) {
       return;
     }
 
+    const prog = data.progress || {};
+    const phaseLine = prog.phase || (data.status === 'queued' ? 'Queued' : 'Starting up...');
+    const statsLine = [];
+    if (prog.turn) statsLine.push('turn ' + prog.turn);
+    if (prog.tool_count) statsLine.push(prog.tool_count + ' tool calls');
+    if (prog.last_tool_ms) statsLine.push('last ' + prog.last_tool_ms + 'ms');
+    const statsStr = statsLine.length ? ' · ' + statsLine.join(' · ') : '';
+
     out.innerHTML =
-      '<div class="status-card"><span class="status"><span class="spinner"></span>' +
-      (data.status === 'queued' ? 'Queued' : 'Running') + ' · ' + elapsed + 's elapsed</span>' +
-      '<div style="color:var(--muted);font-size:13px;margin-top:10px">' +
-      'Typical completion: 60–180 seconds. Running 95+ checks across Technical, Performance, ' +
-      'On-Page, Schema, AEO Discovery/Extraction/Trust/Selection, GEO, and Entity Consistency. ' +
-      'Crawling competitors and querying the Sieve brain for citations.' +
-      '</div></div>';
+      '<div class="status-card">' +
+        '<span class="status"><span class="spinner"></span>' +
+          escapeHtml(phaseLine) + ' · ' + elapsed + 's' +
+        '</span>' +
+        (statsStr ? '<div style="color:var(--muted-2);font-size:12px;margin-top:6px;font-variant-numeric:tabular-nums">' + escapeHtml(statsStr.slice(3)) + '</div>' : '') +
+        '<div style="color:var(--muted);font-size:13px;margin-top:12px;line-height:1.55">' +
+          'Typical completion: 90–300 seconds depending on site complexity. The agent is running 95+ checks across Technical, Performance, On-Page, Schema, AEO Discovery/Extraction/Trust/Selection, GEO, and Entity Consistency — including a 5-competitor crawl and Sieve brain citation enrichment.' +
+        '</div>' +
+      '</div>';
     await new Promise(r => setTimeout(r, 3000));
   }
 }
@@ -977,8 +995,17 @@ def _run_audit_background(audit_id: str, url: str):
         JOBS[audit_id]['status'] = 'running'
         JOBS[audit_id]['started_at'] = datetime.now(timezone.utc).isoformat()
 
+    def _update_progress(info: Dict):
+        """Bound to this audit_id. Receives {phase, tool, turn, tool_count,
+        elapsed_seconds, last_tool_ms} from the agent loop after each tool
+        call. Writes into JOBS so the /audit/{id} endpoint can surface it."""
+        with JOBS_LOCK:
+            if audit_id in JOBS:
+                JOBS[audit_id]['progress'] = info
+
     try:
-        result = run_audit(url, output_dir=str(OUTPUT_DIR))
+        result = run_audit(url, output_dir=str(OUTPUT_DIR),
+                            progress_callback=_update_progress)
         elapsed = round(time.time() - started, 1)
 
         # Agent path returns an error envelope (no exception) when it can't
@@ -1037,6 +1064,10 @@ def get_audit(audit_id: str):
         'started_at': job.get('started_at'),
         'completed_at': job.get('completed_at'),
     }
+
+    # Live progress info (only meaningful while status == 'running')
+    if job.get('progress'):
+        response['progress'] = job['progress']
 
     if job['status'] == 'error':
         response['error'] = job.get('error')

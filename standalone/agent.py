@@ -67,8 +67,46 @@ TOTAL_BUDGET_SECONDS = 900
 # CORE LOOP
 # -----------------------------------------------------------------------------
 
+def _derive_phase_label(tool_name: str, tool_input: Dict[str, Any],
+                         tool_call_history: List[Dict[str, Any]]) -> str:
+    """Map a tool call to a human-readable phase label for UX feedback.
+
+    Heuristic — uses tool name + history context to infer which of the 15
+    phases the agent is currently executing. Not exhaustive (the agent has
+    discretion to call tools in any order) but covers the common patterns.
+    """
+    web_fetch_count = sum(1 for c in tool_call_history if c['name'] == 'web_fetch')
+    web_search_count = sum(1 for c in tool_call_history if c['name'] == 'web_search')
+    query_brain_count = sum(1 for c in tool_call_history if c['name'] == 'query_brain')
+
+    if tool_name == 'run_deterministic_scripts':
+        return "Phase 1.6: Running deterministic scripts (robots, sitemap, schema, FAQ, etc.)"
+    if tool_name == 'render_page_js':
+        return "Phase 1.5: Measuring performance (TTFB, LCP, CLS) via Playwright"
+    if tool_name == 'web_fetch':
+        if web_fetch_count <= 1:
+            return "Phase 1: Fetching target page content"
+        return f"Phase 8: Crawling competitors ({web_fetch_count - 1} of 5)"
+    if tool_name == 'web_search':
+        if web_search_count == 1:
+            return "Phase 3a: Discovering company context"
+        if web_search_count <= 3:
+            return f"Phase 3b: Discovering competitors (search {web_search_count})"
+        return f"Phase 9: GEO brand presence search ({web_search_count} queries)"
+    if tool_name == 'read_reference':
+        ref_name = tool_input.get('name', '')
+        return f"Loading reference: {ref_name}"
+    if tool_name == 'query_brain':
+        check_id = tool_input.get('check_id', '')
+        return f"Phase 13: Querying Sieve brain ({query_brain_count} citations attached) — {check_id}"
+    if tool_name == 'persist_audit':
+        return "Phase 14: Persisting audit + finalizing report"
+    return f"Running {tool_name}"
+
+
 def run_agent_loop(url: str, verbose: bool = False,
-                    log_prefix: str = '') -> Dict[str, Any]:
+                    log_prefix: str = '',
+                    progress_callback: Optional[Any] = None) -> Dict[str, Any]:
     """Drive the Claude tool-use loop until the agent emits <audit>...</audit>.
 
     Returns:
@@ -115,6 +153,26 @@ def run_agent_loop(url: str, verbose: bool = False,
     started = time.time()
     pfx = log_prefix or ''
     log.info('%sloop start url=%s', pfx, url)
+
+    def _emit_progress(phase: str, tool_name: str = '',
+                        turn_num: int = 0, tool_count: int = 0,
+                        last_tool_ms: int = 0):
+        """Fire progress_callback if provided. Safe — failures don't crash loop."""
+        if progress_callback is None:
+            return
+        try:
+            progress_callback({
+                'phase': phase,
+                'tool': tool_name,
+                'turn': turn_num,
+                'tool_count': tool_count,
+                'elapsed_seconds': round(time.time() - started, 1),
+                'last_tool_ms': last_tool_ms,
+            })
+        except Exception as e:
+            log.warning('%sprogress_callback failed: %s', pfx, e)
+
+    _emit_progress('Phase 0: Starting audit — initializing agent loop')
 
     for turn in range(MAX_AGENT_TURNS):
         turns = turn + 1
@@ -178,6 +236,19 @@ def run_agent_loop(url: str, verbose: bool = False,
                 tname = getattr(block, "name", "server_tool")
                 tin = getattr(block, "input", None) or {}
                 log.info('%s  → [server] %s(%s)', pfx, tname, _short(tin))
+                # Record in tool_call_log so phase derivation sees the right counts
+                tool_call_log.append({
+                    "turn": turns, "name": tname,
+                    "input_keys": list(tin.keys()) if isinstance(tin, dict) else [],
+                    "input_preview": _short(tin),
+                    "ms": 0,
+                    "result_size": 0,
+                    "had_error": False,
+                    "server_side": True,
+                })
+                # Emit progress for server tools too
+                phase_label = _derive_phase_label(tname, tin if isinstance(tin, dict) else {}, tool_call_log)
+                _emit_progress(phase_label, tname, turns, len(tool_call_log))
             elif btype in ("web_search_tool_result", "web_fetch_tool_result"):
                 # Result of a server tool — Anthropic already executed it.
                 # Log size if we can.
@@ -188,6 +259,8 @@ def run_agent_loop(url: str, verbose: bool = False,
 
         if stop_reason == "end_turn":
             log.info('%send_turn at turn=%d', pfx, turns)
+            _emit_progress(f'Phase 14: Final audit JSON emitted (turn {turns})',
+                           '', turns, len(tool_call_log))
             break
 
         if stop_reason != "tool_use":
@@ -243,6 +316,10 @@ def run_agent_loop(url: str, verbose: bool = False,
             if had_error:
                 err_msg = (result.get("error") if isinstance(result, dict) else "?")
                 log.error('%s    error: %s', pfx, err_msg)
+
+            # Emit live progress so the homepage can show "Phase X: ..." in spinner
+            phase_label = _derive_phase_label(name, tinput, tool_call_log)
+            _emit_progress(phase_label, name, turns, len(tool_call_log), elapsed_ms)
             if verbose:
                 print(f"  → {name}({_short(tinput)}) "
                       f"[{elapsed_ms}ms, {len(result_str)}B]", flush=True)
@@ -354,7 +431,8 @@ def _extract_audit_json(text: str, errors: List[str]) -> Optional[Dict[str, Any]
 # -----------------------------------------------------------------------------
 
 def run_audit_agent(url: str, output_dir: str = "./audits/",
-                     verbose: bool = False) -> Dict[str, Any]:
+                     verbose: bool = False,
+                     progress_callback: Optional[Any] = None) -> Dict[str, Any]:
     """Run the agent loop, attach metadata, render artifacts, return result.
 
     Output shape matches the existing `run_audit()` from audit_pipeline.py so
@@ -369,7 +447,8 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         print(f"[agent] starting audit {audit_id} for {url}", flush=True)
 
     loop_result = run_agent_loop(url, verbose=verbose,
-                                  log_prefix=f'[{audit_id[:8]}] ')
+                                  log_prefix=f'[{audit_id[:8]}] ',
+                                  progress_callback=progress_callback)
 
     audit = loop_result.get("audit")
 
