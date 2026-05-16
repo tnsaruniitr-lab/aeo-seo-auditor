@@ -68,8 +68,11 @@ except ImportError:
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import secrets
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, HttpUrl
 
 from audit_pipeline import run_audit as run_audit_deterministic
@@ -174,6 +177,54 @@ app = FastAPI(
                 'Powered by 12,764-entry Sieve brain + Anthropic Sonnet 4.6.',
     version='4.0',
 )
+
+
+# ----------------------------------------------------------------------
+# AUTH — HTTP Basic, credentials from env vars (never in code)
+# ----------------------------------------------------------------------
+# Set in Railway: AUDIT_USERNAME and AUDIT_PASSWORD env vars.
+# If either is unset, AUTH IS DISABLED (service is fully public).
+# Always set both in production.
+
+AUDIT_USERNAME = os.getenv('AUDIT_USERNAME', '')
+AUDIT_PASSWORD = os.getenv('AUDIT_PASSWORD', '')
+AUTH_ENABLED = bool(AUDIT_USERNAME and AUDIT_PASSWORD)
+
+if not AUTH_ENABLED:
+    log.warning('AUTH DISABLED — AUDIT_USERNAME / AUDIT_PASSWORD env vars not set. '
+                'Service is publicly accessible. Set both in Railway to enable auth.')
+else:
+    log.info('AUTH enabled for user=%s', AUDIT_USERNAME)
+
+_basic = HTTPBasic(auto_error=False)
+
+
+def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(_basic)):
+    """Verify HTTP Basic credentials against env-var-defined username/password.
+
+    If AUTH_ENABLED is False (env vars unset), allows all requests.
+    Uses constant-time comparison to prevent timing attacks.
+    Raises 401 with WWW-Authenticate header so browsers auto-prompt.
+    """
+    if not AUTH_ENABLED:
+        return True
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Authentication required',
+            headers={'WWW-Authenticate': 'Basic realm="AEO Auditor"'},
+        )
+
+    user_ok = secrets.compare_digest(credentials.username, AUDIT_USERNAME)
+    pass_ok = secrets.compare_digest(credentials.password, AUDIT_PASSWORD)
+    if not (user_ok and pass_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Invalid credentials',
+            headers={'WWW-Authenticate': 'Basic realm="AEO Auditor"'},
+        )
+    return True
 
 
 @app.middleware('http')
@@ -903,12 +954,12 @@ function escapeHtml(s) {
 
 
 @app.get('/', response_class=HTMLResponse)
-def root():
+def root(_: bool = Depends(require_auth)):
     return HTMLResponse(INDEX_HTML)
 
 
 @app.get('/api')
-def api_info():
+def api_info(_: bool = Depends(require_auth)):
     return {
         'service': 'aeo-seo-auditor',
         'version': '4.0',
@@ -942,6 +993,7 @@ def healthz():
             'agent_available': AGENT_AVAILABLE,
             'agent_import_error': None if AGENT_AVAILABLE else _AGENT_IMPORT_ERROR,
             'web_tools': 'anthropic_native_server_tools',
+            'auth_enabled': AUTH_ENABLED,
             'output_dir': str(OUTPUT_DIR),
         }
     except Exception as e:
@@ -955,7 +1007,8 @@ def healthz():
 
 
 @app.post('/audit', response_model=AuditResponse)
-async def submit_audit(req: AuditRequest, background_tasks: BackgroundTasks):
+async def submit_audit(req: AuditRequest, background_tasks: BackgroundTasks,
+                        _: bool = Depends(require_auth)):
     """Submit a URL for audit. Returns audit_id immediately; audit runs async.
 
     Poll GET /audit/{id} for status. Typical completion: 60-120 seconds.
@@ -1051,7 +1104,7 @@ def _run_audit_background(audit_id: str, url: str):
 
 
 @app.get('/audit/{audit_id}', response_model=AuditStatusResponse)
-def get_audit(audit_id: str):
+def get_audit(audit_id: str, _: bool = Depends(require_auth)):
     """Fetch audit status + summary. Poll until status == 'completed'."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
@@ -1109,7 +1162,7 @@ def get_audit(audit_id: str):
 # Artifact endpoints use /audit/{id}/{format} (slash separator) to avoid
 # greedy-matching with the bare /audit/{id} route.
 @app.get('/audit/{audit_id}/json')
-def get_audit_json(audit_id: str):
+def get_audit_json(audit_id: str, _: bool = Depends(require_auth)):
     """Full audit JSON."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
@@ -1123,7 +1176,7 @@ def get_audit_json(audit_id: str):
 
 
 @app.get('/audit/{audit_id}/md')
-def get_audit_markdown(audit_id: str):
+def get_audit_markdown(audit_id: str, _: bool = Depends(require_auth)):
     """Markdown audit report."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
@@ -1137,7 +1190,7 @@ def get_audit_markdown(audit_id: str):
 
 
 @app.get('/audit/{audit_id}/pdf')
-def get_audit_pdf(audit_id: str):
+def get_audit_pdf(audit_id: str, _: bool = Depends(require_auth)):
     """1-page PDF summary."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
@@ -1154,7 +1207,7 @@ def get_audit_pdf(audit_id: str):
 
 
 @app.get('/audits')
-def list_audits():
+def list_audits(_: bool = Depends(require_auth)):
     """List all audits in this service instance (in-memory only, lost on restart)."""
     with JOBS_LOCK:
         return {
