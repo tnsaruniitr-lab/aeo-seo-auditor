@@ -655,6 +655,29 @@ def list_audits_for_domain(domain: str, limit: int = 10) -> list:
         return []
 
 
+def list_all_audits(limit: int = 60) -> list:
+    """Return all persisted audits, newest first — powers the homepage
+    library grid. Compact projection: enough for an audit card."""
+    base, headers = _supabase_base_headers()
+    if base is None:
+        return []
+    try:
+        import httpx
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(
+                f"{base}/rest/v1/website_audits",
+                headers=headers,
+                params={"select": "audit_id,domain,url,page_type,industry,"
+                                  "overall_score,overall_grade,findings_count,"
+                                  "audit_date,created_at",
+                        "order": "created_at.desc",
+                        "limit": str(limit)},
+            )
+            return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
 # ============================================================================
 # TOOL DISPATCH TABLE — used by agent.py
 # ============================================================================

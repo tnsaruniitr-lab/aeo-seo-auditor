@@ -91,11 +91,13 @@ except Exception as _agent_import_err:
 
 # Supabase read path — for reloading persisted audits by domain or id.
 try:
-    from tools import fetch_audit, list_audits_for_domain
+    from tools import fetch_audit, list_audits_for_domain, list_all_audits
 except Exception:
     def fetch_audit(*_a, **_k):  # type: ignore
         return None
     def list_audits_for_domain(*_a, **_k):  # type: ignore
+        return []
+    def list_all_audits(*_a, **_k):  # type: ignore
         return []
 
 
@@ -475,6 +477,35 @@ INDEX_HTML = r"""<!doctype html>
   .links a:hover { border-color: var(--accent); color:var(--accent);
     text-decoration:none; }
 
+  /* Library — audit cards grid */
+  .lib-head { display:flex; align-items:baseline; justify-content:space-between;
+    margin:36px 0 14px; }
+  .lib-head h2 { margin:0; }
+  .lib-count { color:var(--muted-2); font-size:12px; }
+  .lib-grid { display:grid; gap:12px;
+    grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); }
+  .lib-card { display:block; background:var(--panel); border:1px solid var(--border);
+    border-radius:11px; padding:16px 18px; text-decoration:none; color:inherit;
+    transition:border-color 0.15s, transform 0.1s, background 0.15s; }
+  .lib-card:hover { border-color:var(--accent); transform:translateY(-2px);
+    background:var(--panel-2); text-decoration:none; }
+  .lib-domain { font-weight:600; font-size:14.5px; color:var(--fg);
+    word-break:break-all; line-height:1.35; }
+  .lib-sub { color:var(--muted); font-size:12px; margin-top:3px; }
+  .lib-row { display:flex; align-items:center; gap:12px; margin-top:14px; }
+  .lib-score { font-size:30px; font-weight:700; letter-spacing:-0.02em;
+    line-height:1; font-variant-numeric:tabular-nums; }
+  .lib-grade { font-size:14px; font-weight:700; padding:3px 10px; border-radius:6px;
+    background:#222; line-height:1; }
+  .lib-grade.A, .lib-grade.B { background:var(--good-bg); color:var(--good); }
+  .lib-grade.C { background:var(--warn-bg); color:var(--warn); }
+  .lib-grade.D, .lib-grade.F { background:var(--bad-bg); color:var(--bad); }
+  .lib-meta { margin-left:auto; text-align:right; color:var(--muted-2);
+    font-size:11px; line-height:1.5; }
+  .lib-empty { color:var(--muted); font-size:13px; padding:20px;
+    background:var(--panel); border:1px solid var(--border); border-radius:11px;
+    text-align:center; }
+
   /* Footer */
   footer { color:var(--muted); font-size:12px; margin-top:48px;
     text-align:center; padding-top:20px; border-top:1px solid var(--border); }
@@ -496,6 +527,8 @@ INDEX_HTML = r"""<!doctype html>
   </form>
 
   <div id="out"></div>
+
+  <div id="library"></div>
 
   <footer>
     JSON API: <a href="/api">/api</a> · Health: <a href="/healthz">/healthz</a> · Docs: <a href="/docs">/docs</a>
@@ -570,10 +603,12 @@ async function poll(id) {
         if (rJson.ok) {
           const fullAudit = await rJson.json();
           renderFull(fullAudit, data, id);
+          loadLibrary();  // refresh the grid so the new audit appears
           return;
         }
       } catch(e) { /* fall through to summary render */ }
       renderSummary(data, id);
+      loadLibrary();
       return;
     }
     if (data.status === 'error') {
@@ -993,11 +1028,64 @@ async function loadAuditByDomain(domain) {
   }
 }
 
+// ---- Library: grid of past audits on the homepage --------------------
+
+async function loadLibrary() {
+  const lib = document.getElementById('library');
+  if (!lib) return;
+  try {
+    const r = await fetch('/api/audits');
+    if (!r.ok) return;
+    const data = await r.json();
+    renderLibrary(data.audits || []);
+  } catch (e) { /* library is non-critical — fail silent */ }
+}
+
+function renderLibrary(audits) {
+  const lib = document.getElementById('library');
+  if (!lib) return;
+  if (!audits.length) {
+    lib.innerHTML =
+      '<div class="lib-head"><h2>Recent audits</h2></div>' +
+      '<div class="lib-empty">No audits yet — run your first one above. ' +
+      'Once an audit completes it appears here, and you can reopen it any ' +
+      'time at audits.growthmonk.ai/&lt;domain&gt;.</div>';
+    return;
+  }
+  let cards = '';
+  for (const a of audits) {
+    const grade = (a.overall_grade || '').charAt(0).toUpperCase();
+    const date = (a.created_at || a.audit_date || '').slice(0, 10);
+    const meta = [a.page_type, a.industry].filter(Boolean).join(' · ');
+    cards +=
+      '<a class="lib-card" href="/' + encodeURIComponent(a.domain || '') + '">' +
+        '<div class="lib-domain">' + escapeHtml(a.domain || a.url || '—') + '</div>' +
+        (meta ? '<div class="lib-sub">' + escapeHtml(meta) + '</div>' : '') +
+        '<div class="lib-row">' +
+          '<span class="lib-score">' + (a.overall_score ?? '—') + '</span>' +
+          '<span class="lib-grade ' + escapeHtml(grade) + '">' +
+            escapeHtml(a.overall_grade || '—') + '</span>' +
+          '<span class="lib-meta">' +
+            (a.findings_count != null ? a.findings_count + ' findings<br>' : '') +
+            escapeHtml(date) +
+          '</span>' +
+        '</div>' +
+      '</a>';
+  }
+  lib.innerHTML =
+    '<div class="lib-head"><h2>Recent audits</h2>' +
+    '<span class="lib-count">' + audits.length + ' audit' +
+    (audits.length === 1 ? '' : 's') + '</span></div>' +
+    '<div class="lib-grid">' + cards + '</div>';
+}
+
 (function init() {
-  // Strip leading/trailing slashes from the path. '' => homepage form.
+  // Strip leading/trailing slashes from the path. '' => homepage form + library.
   const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
   if (path) {
     loadAuditByDomain(decodeURIComponent(path));
+  } else {
+    loadLibrary();
   }
 })();
 </script>
@@ -1391,6 +1479,12 @@ def api_by_id(audit_id: str, _: bool = Depends(require_auth)):
 def api_history(domain: str, _: bool = Depends(require_auth)):
     """Compact list of past audits for a domain (newest first)."""
     return {'domain': domain, 'audits': list_audits_for_domain(domain)}
+
+
+@app.get('/api/audits')
+def api_audits(_: bool = Depends(require_auth)):
+    """All persisted audits, newest first — powers the homepage library grid."""
+    return {'audits': list_all_audits()}
 
 
 # ----------------------------------------------------------------------
