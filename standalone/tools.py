@@ -363,54 +363,145 @@ def read_reference(name: str) -> Dict[str, Any]:
 # ============================================================================
 
 def persist_audit(audit_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Persist a completed audit. Tries Supabase if configured, always returns
-    a deterministic local-only success.
+    """Persist a completed audit to Supabase — both the audit summary row
+    and one row per finding.
 
-    Returns: {"persisted": bool, "supabase_audit_id": str|None, "error": str|None}
+    Writes to project htowtfnbfmjmbeftfhis (set via SUPABASE_URL env var):
+        - public.website_audits          (1 row, 30-column schema)
+        - public.website_audit_findings  (N rows, FK on audit_id)
+
+    Uses the service_role key (SUPABASE_SERVICE_KEY) which bypasses RLS.
+    If either env var is unset, returns a local-only no-op success.
+
+    Returns:
+        {
+          "persisted": bool,
+          "supabase_row_id": str | None,   # the table's gen_random_uuid() id
+          "audit_id": str,                  # the agent's own audit uuid
+          "findings_persisted": int,
+          "error": str | None,
+        }
     """
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
+    audit_id = audit_data.get("audit_id")
+
     if not (supabase_url and supabase_key):
-        return {"persisted": False, "supabase_audit_id": None,
+        return {"persisted": False, "supabase_row_id": None,
+                "audit_id": audit_id, "findings_persisted": 0,
                 "note": "Supabase env vars not set — local-only persistence."}
 
     try:
         import httpx
     except ImportError:
-        return {"persisted": False, "error": "httpx not installed"}
+        return {"persisted": False, "error": "httpx not installed",
+                "audit_id": audit_id, "findings_persisted": 0}
 
+    base = supabase_url.rstrip("/")
     headers = {
         "apikey": supabase_key,
         "Authorization": f"Bearer {supabase_key}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation",
     }
+
+    classification = audit_data.get("classification", {}) or {}
+    context = audit_data.get("context", {}) or {}
+    scoring = audit_data.get("scoring", {}) or {}
+    findings = audit_data.get("findings", []) or []
+
+    # ---- Audit summary row — matches the 30-column website_audits schema ----
     audit_row = {
-        "audit_id": audit_data.get("audit_id"),
+        "audit_id": audit_id,
         "url": audit_data.get("url"),
         "domain": audit_data.get("domain"),
-        "page_type": audit_data.get("classification", {}).get("page_type"),
-        "industry": audit_data.get("classification", {}).get("industry"),
-        "overall_score": audit_data.get("scoring", {}).get("overall_score"),
-        "overall_grade": audit_data.get("scoring", {}).get("overall_grade"),
-        "section_scores": audit_data.get("scoring", {}).get("section_scores"),
+        "audit_date": audit_data.get("date"),
+        "page_type": classification.get("page_type"),
+        "industry": classification.get("industry"),
+        "company_name": classification.get("company_name"),
+        "confidence": classification.get("confidence"),
+        "competitors": context.get("competitors"),
+        "test_queries": context.get("test_queries"),
+        "gates": audit_data.get("gates"),
+        "section_scores": scoring.get("section_scores"),
+        "page_citation_readiness": scoring.get("page_citation_readiness"),
+        "brand_ai_presence": scoring.get("brand_ai_presence"),
+        "seo_score": scoring.get("seo_score"),
+        "aeo_score": scoring.get("aeo_score"),
+        "citation_readiness": scoring.get("citation_readiness"),
+        "overall_score": scoring.get("overall_score"),
+        "overall_grade": scoring.get("overall_grade"),
         "narrative": audit_data.get("narrative"),
+        "competitor_comparison": audit_data.get("competitor_comparison"),
+        "bots_eye_view": audit_data.get("bots_eye_view"),
+        "performance": audit_data.get("performance"),
+        "supplementary_findings": audit_data.get("supplementary_findings"),
+        "metadata": audit_data.get("metadata"),
+        "findings_count": len(findings),
         "duration_seconds": audit_data.get("duration_seconds"),
-        "created_at": audit_data.get("date"),
+        "audit_mode": (audit_data.get("metadata", {}) or {}).get("version", "agent"),
     }
+
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=20.0) as client:
+            # 1. Insert the audit summary row. resolution=merge-duplicates makes
+            #    a re-persist of the same audit_id idempotent (upsert on the
+            #    unique audit_id column).
             r = client.post(
-                f"{supabase_url}/rest/v1/website_audits",
-                headers=headers, json=audit_row,
+                f"{base}/rest/v1/website_audits",
+                headers={**headers,
+                         "Prefer": "return=representation,resolution=merge-duplicates"},
+                json=audit_row,
             )
-        if r.status_code in (200, 201):
-            return {"persisted": True,
-                    "supabase_audit_id": audit_data.get("audit_id")}
-        return {"persisted": False,
-                "error": f"status {r.status_code}: {r.text[:300]}"}
+            if r.status_code not in (200, 201):
+                return {"persisted": False,
+                        "error": f"website_audits insert status {r.status_code}: "
+                                 f"{r.text[:400]}",
+                        "audit_id": audit_id, "findings_persisted": 0}
+            inserted = r.json()
+            row_id = inserted[0].get("id") if inserted else None
+
+            # 2. Insert findings (batch). Replace any existing rows for this
+            #    audit_id first so a re-persist doesn't duplicate.
+            findings_persisted = 0
+            if findings:
+                client.delete(
+                    f"{base}/rest/v1/website_audit_findings",
+                    headers=headers,
+                    params={"audit_id": f"eq.{audit_id}"},
+                )
+                findings_rows = [
+                    {
+                        "audit_id": audit_id,
+                        "check_id": f.get("check_id"),
+                        "section": f.get("section"),
+                        "status": f.get("status"),
+                        "severity": f.get("severity"),
+                        "evidence": (f.get("evidence") or "")[:4000],
+                        "truth_badge": f.get("truth_badge"),
+                        "fix_type": f.get("fix_type"),
+                        "citations": f.get("citations"),
+                    }
+                    for f in findings
+                ]
+                fr = client.post(
+                    f"{base}/rest/v1/website_audit_findings",
+                    headers={**headers, "Prefer": "return=minimal"},
+                    json=findings_rows,
+                )
+                if fr.status_code in (200, 201):
+                    findings_persisted = len(findings_rows)
+                else:
+                    # Audit row saved; findings failed — report partial success
+                    return {"persisted": True, "supabase_row_id": row_id,
+                            "audit_id": audit_id, "findings_persisted": 0,
+                            "error": f"findings insert status {fr.status_code}: "
+                                     f"{fr.text[:300]}"}
+
+        return {"persisted": True, "supabase_row_id": row_id,
+                "audit_id": audit_id, "findings_persisted": findings_persisted}
     except Exception as e:
-        return {"persisted": False, "error": f"{type(e).__name__}: {e}"}
+        return {"persisted": False, "error": f"{type(e).__name__}: {e}",
+                "audit_id": audit_id, "findings_persisted": 0}
 
 
 # ============================================================================
