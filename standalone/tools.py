@@ -397,7 +397,14 @@ def persist_audit(audit_data: Dict[str, Any]) -> Dict[str, Any]:
         return {"persisted": False, "error": "httpx not installed",
                 "audit_id": audit_id, "findings_persisted": 0}
 
+    # Normalize the URL — tolerate a SUPABASE_URL that was pasted with a
+    # trailing /rest/v1 (a common mistake; persist appends that itself).
     base = supabase_url.rstrip("/")
+    for suffix in ("/rest/v1", "/rest"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+    base = base.rstrip("/")
+
     headers = {
         "apikey": supabase_key,
         "Authorization": f"Bearer {supabase_key}",
