@@ -1228,6 +1228,76 @@ def list_audits(_: bool = Depends(require_auth)):
         }
 
 
+@app.post('/debug/persist-test')
+def debug_persist_test(_: bool = Depends(require_auth)):
+    """Diagnostic — write a synthetic dummy audit via persist_audit() to
+    verify Supabase connectivity from THIS container, without running a
+    full (~$2, ~7min) audit.
+
+    Returns the persist result + non-secret env diagnostics. The test row
+    has a recognizable 'persist-test-*' audit_id and can be cleaned up
+    afterwards. Gated behind auth like every other route.
+    """
+    try:
+        from tools import persist_audit
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={'error': f'cannot import persist_audit: {e}'})
+
+    test_id = f'persist-test-{uuid.uuid4().hex[:8]}'
+    now = datetime.now(timezone.utc)
+    dummy = {
+        'audit_id': test_id,
+        'url': 'https://persist-test.example.com/',
+        'domain': 'persist-test.example.com',
+        'date': now.strftime('%Y-%m-%d'),
+        'classification': {'page_type': 'homepage', 'industry': 'saas',
+                            'company_name': 'Persist Test', 'confidence': 'high'},
+        'context': {'competitors': ['example-a.com'],
+                    'test_queries': {'primary': 'persistence test'}},
+        'gates': {'crawlability': 'pass', 'content_access': 'pass',
+                  'page_existence': 'pass'},
+        'scoring': {'section_scores': {'A_technical': 100, 'B_performance': 100},
+                    'page_citation_readiness': 99, 'brand_ai_presence': 99,
+                    'seo_score': 99, 'aeo_score': 99, 'citation_readiness': 99,
+                    'overall_score': 99, 'overall_grade': 'A+'},
+        'narrative': {'executive_diagnosis': 'Synthetic persistence test row — '
+                                             'safe to delete.'},
+        'competitor_comparison': [],
+        'bots_eye_view': {'classification': 'fully_accessible'},
+        'performance': {'ttfb_ms': 1},
+        'supplementary_findings': [],
+        'metadata': {'version': 'persist-test'},
+        'duration_seconds': 0.0,
+        'findings': [
+            {'check_id': 'TEST_A1', 'section': 'A', 'status': 'pass',
+             'severity': 'info', 'evidence': 'Synthetic finding for persist test.',
+             'truth_badge': 'HARD EVIDENCE', 'fix_type': None,
+             'citations': [{'id': 1, 'kind': 'rule', 'tier': 1,
+                            'source_org': 'TestOrg'}]},
+        ],
+    }
+    result = persist_audit(dummy)
+
+    # Non-secret env diagnostics — URL is not a secret; key shown only as
+    # prefix + length so a wrong-key paste is visible without leaking it.
+    surl = os.getenv('SUPABASE_URL', '')
+    skey = os.getenv('SUPABASE_SERVICE_KEY', '')
+    return {
+        'test_audit_id': test_id,
+        'persist_result': result,
+        'env_diagnostics': {
+            'SUPABASE_URL': surl or '(unset)',
+            'SUPABASE_SERVICE_KEY_set': bool(skey),
+            'SUPABASE_SERVICE_KEY_prefix': (skey[:10] + '...') if skey else None,
+            'SUPABASE_SERVICE_KEY_length': len(skey),
+        },
+        'hint': 'If persisted=true, the integration works. If false, read '
+                'persist_result.error. A service key should start with '
+                '"sb_secret_" or "eyJ" — anything else is the wrong key.',
+    }
+
+
 if __name__ == '__main__':
     import uvicorn
     port = int(os.getenv('PORT', 8000))
