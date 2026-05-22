@@ -57,8 +57,9 @@ static-rules, check-definitions, schema-validation, knowledge-seo, \
 knowledge-performance, knowledge-aeo, knowledge-geo, aeo-framework, geo-framework, \
 scoring-rubric, brain-mappings, competitor-gap-template, supabase-queries.
 
-7. `persist_audit(audit_data)` — best-effort Supabase INSERT. Always call once at \
-the end with the full audit dict.
+You have 6 tools. Persistence to the database is handled automatically by \
+the runtime AFTER you emit the final audit JSON — there is no persist tool \
+for you to call.
 
 # 15-PHASE EXECUTION PLAYBOOK
 
@@ -189,7 +190,9 @@ the related finding's `citations` array. Empty citations array `[]` is \
 acceptable when `query_brain` returned no results — but never partial / reshaped \
 citation objects.
 
-**Phase 14a: Persist.** Call `persist_audit(audit_data)` once. Best-effort.
+**Phase 14a: Persist.** Persistence is automatic — the runtime saves the \
+audit to the database after you emit the final JSON. Do not call any tool \
+for this. Just make sure the final JSON is complete and well-formed.
 
 **Phase 14b/c: Report.** Construct the final structured JSON output (schema below). \
 Render as the agent's final response after `submit_audit` (see below).

@@ -528,10 +528,36 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     else:
         audit["pdf_path"] = None
 
+    # ------------------------------------------------------------------
+    # Persist to Supabase — POST-LOOP, with the real audit_id + complete
+    # audit dict. This is NOT an agent tool: the agent never knows the real
+    # audit_id (it's injected above) and the full audit only exists here.
+    # Best-effort: a persistence failure never fails the audit itself.
+    # ------------------------------------------------------------------
+    try:
+        from tools import persist_audit
+        persist_result = persist_audit(audit)
+        md["persistence"] = persist_result
+        if persist_result.get("persisted"):
+            log.info('%spersisted to Supabase: row_id=%s findings=%d',
+                     f'[{audit_id[:8]}] ',
+                     persist_result.get("supabase_row_id"),
+                     persist_result.get("findings_persisted", 0))
+        else:
+            log.warning('%snot persisted: %s',
+                        f'[{audit_id[:8]}] ',
+                        persist_result.get("error") or persist_result.get("note"))
+    except Exception as e:
+        md["persistence"] = {"persisted": False,
+                             "error": f"{type(e).__name__}: {e}"}
+        log.error('%spersist_audit crashed: %s\n%s',
+                  f'[{audit_id[:8]}] ', e, traceback.format_exc())
+
     if verbose:
         print(f"[agent] complete in {duration}s, "
               f"{md['tool_call_count']} tool calls, "
-              f"{md['input_tokens']}+{md['output_tokens']} tokens",
+              f"{md['input_tokens']}+{md['output_tokens']} tokens, "
+              f"persisted={md.get('persistence', {}).get('persisted')}",
               flush=True)
 
     return audit

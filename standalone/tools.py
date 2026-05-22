@@ -510,12 +510,14 @@ def persist_audit(audit_data: Dict[str, Any]) -> Dict[str, Any]:
 
 # Only CLIENT-side tools are dispatched in this table.
 # Server-side tools (web_search, web_fetch) are executed by Anthropic itself.
+# NOTE: persist_audit is intentionally NOT here — it is a post-loop step
+# called directly by run_audit_agent() with the real audit_id + complete
+# audit dict, not a tool the agent invokes mid-loop.
 TOOLS_IMPL = {
     "render_page_js": render_page_js,
     "run_deterministic_scripts": run_deterministic_scripts,
     "query_brain": query_brain,
     "read_reference": read_reference,
-    "persist_audit": persist_audit,
 }
 
 # Names of Anthropic server-side tools — agent.py skips these in dispatch
@@ -628,20 +630,6 @@ TOOLS_SPEC = [
                 },
             },
             "required": ["name"],
-        },
-    },
-    {
-        "name": "persist_audit",
-        "description": (
-            "Persist a completed audit. Best-effort Supabase INSERT to "
-            "website_audits if SUPABASE_URL + SUPABASE_SERVICE_KEY are set; "
-            "otherwise no-op success. Always call once at the end of Phase 14a "
-            "with the full audit dict."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {"audit_data": {"type": "object"}},
-            "required": ["audit_data"],
         },
     },
 ]
