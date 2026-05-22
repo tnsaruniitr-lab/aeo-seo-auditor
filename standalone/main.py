@@ -89,6 +89,15 @@ except Exception as _agent_import_err:
     AGENT_AVAILABLE = False
     _AGENT_IMPORT_ERROR = str(_agent_import_err)
 
+# Supabase read path — for reloading persisted audits by domain or id.
+try:
+    from tools import fetch_audit, list_audits_for_domain
+except Exception:
+    def fetch_audit(*_a, **_k):  # type: ignore
+        return None
+    def list_audits_for_domain(*_a, **_k):  # type: ignore
+        return []
+
 
 def run_audit(url: str, output_dir: str, progress_callback=None):
     """Dispatch to the chosen audit pipeline.
@@ -651,6 +660,11 @@ function renderFull(audit, status, id) {
     renderDownloads(id, status.artifacts || {}),
   ];
   out.innerHTML = html.filter(Boolean).join('');
+  // Reflect the audited domain in the URL so the page is bookmarkable /
+  // shareable as audits.growthmonk.ai/{domain}.
+  if (audit && audit.domain) {
+    try { history.replaceState({}, '', '/' + audit.domain); } catch (e) {}
+  }
 }
 
 function renderHero(s, duration, findingsCount) {
@@ -947,6 +961,45 @@ function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+// ---- Slug routing: audits.growthmonk.ai/{domain} ----------------------
+// On load, if the path is /{domain}, fetch and render that domain's
+// latest persisted audit. Path '/' shows the empty form as normal.
+
+async function loadAuditByDomain(domain) {
+  out.innerHTML = '<div class="status-card"><span class="status">' +
+    '<span class="spinner"></span>Loading latest audit for ' +
+    escapeHtml(domain) + '…</span></div>';
+  try {
+    const r = await fetch('/api/by-domain/' + encodeURIComponent(domain));
+    if (r.status === 404) {
+      $('url').value = /^https?:\/\//.test(domain) ? domain : 'https://' + domain;
+      out.innerHTML = '<div class="status-card">No saved audit for <strong>' +
+        escapeHtml(domain) + '</strong> yet. Click "Run audit" above to create one.' +
+        '</div>';
+      return;
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()));
+    const audit = await r.json();
+    const id = audit.audit_id;
+    renderFull(audit, {artifacts: {
+      json: '/audit/' + id + '/json',
+      markdown: '/audit/' + id + '/md',
+      pdf: '/audit/' + id + '/pdf',
+    }}, id);
+  } catch (err) {
+    out.innerHTML = renderError('Could not load audit for ' +
+      escapeHtml(domain) + '\n\n' + escapeHtml(err.message));
+  }
+}
+
+(function init() {
+  // Strip leading/trailing slashes from the path. '' => homepage form.
+  const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+  if (path) {
+    loadAuditByDomain(decodeURIComponent(path));
+  }
+})();
 </script>
 </body>
 </html>
@@ -1166,16 +1219,23 @@ def get_audit(audit_id: str, _: bool = Depends(require_auth)):
 # greedy-matching with the bare /audit/{id} route.
 @app.get('/audit/{audit_id}/json')
 def get_audit_json(audit_id: str, _: bool = Depends(require_auth)):
-    """Full audit JSON."""
+    """Full audit JSON. Serves the on-disk file if the audit is still in
+    memory; otherwise falls back to Supabase (so old audit_ids survive
+    Railway redeploys)."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
-    if not job or job['status'] != 'completed':
-        raise HTTPException(status_code=404, detail='audit not ready or not found')
-    json_path = job['result'].get('json_path')
-    if not json_path or not Path(json_path).exists():
-        raise HTTPException(status_code=404, detail='json artifact not found')
-    return FileResponse(json_path, media_type='application/json',
-                         filename=f'{audit_id}.json')
+    if job and job['status'] == 'completed':
+        json_path = job['result'].get('json_path')
+        if json_path and Path(json_path).exists():
+            return FileResponse(json_path, media_type='application/json',
+                                 filename=f'{audit_id}.json')
+        # In memory but the ephemeral file is gone — serve the dict directly.
+        return JSONResponse(job['result'])
+    # Not in memory — reload from Supabase.
+    audit = fetch_audit(audit_id=audit_id)
+    if audit:
+        return JSONResponse(audit)
+    raise HTTPException(status_code=404, detail='audit not found')
 
 
 @app.get('/audit/{audit_id}/md')
@@ -1296,6 +1356,64 @@ def debug_persist_test(_: bool = Depends(require_auth)):
                 'persist_result.error. A service key should start with '
                 '"sb_secret_" or "eyJ" — anything else is the wrong key.',
     }
+
+
+# ----------------------------------------------------------------------
+# AUDIT RELOAD — fetch persisted audits by domain or id (from Supabase)
+# ----------------------------------------------------------------------
+
+@app.get('/api/by-domain/{domain:path}')
+def api_by_domain(domain: str, _: bool = Depends(require_auth)):
+    """Latest persisted audit for a domain, reassembled into the full
+    audit-JSON shape the homepage renderer consumes."""
+    audit = fetch_audit(domain=domain)
+    if not audit:
+        raise HTTPException(status_code=404,
+                            detail=f'no persisted audit for domain: {domain}')
+    return JSONResponse(audit)
+
+
+@app.get('/api/by-id/{audit_id}')
+def api_by_id(audit_id: str, _: bool = Depends(require_auth)):
+    """A specific audit by id — checks in-memory JOBS first (freshest),
+    then falls back to Supabase (survives redeploys)."""
+    with JOBS_LOCK:
+        job = JOBS.get(audit_id)
+    if job and job.get('result') and not job['result'].get('error'):
+        return JSONResponse(job['result'])
+    audit = fetch_audit(audit_id=audit_id)
+    if not audit:
+        raise HTTPException(status_code=404, detail='audit not found')
+    return JSONResponse(audit)
+
+
+@app.get('/api/history/{domain:path}')
+def api_history(domain: str, _: bool = Depends(require_auth)):
+    """Compact list of past audits for a domain (newest first)."""
+    return {'domain': domain, 'audits': list_audits_for_domain(domain)}
+
+
+# ----------------------------------------------------------------------
+# CATCH-ALL SLUG ROUTE — audits.growthmonk.ai/{domain}
+# MUST be the LAST route registered so it never shadows explicit routes.
+# Serves the homepage HTML; the page JS reads the path and fetches that
+# domain's persisted audit via /api/by-domain.
+# ----------------------------------------------------------------------
+
+_RESERVED_SLUGS = {
+    'api', 'healthz', 'audit', 'audits', 'debug', 'docs', 'redoc',
+    'openapi.json', 'favicon.ico', 'static', 'robots.txt',
+}
+
+
+@app.get('/{slug}', response_class=HTMLResponse)
+def slug_page(slug: str, _: bool = Depends(require_auth)):
+    """Catch-all for /{domain}. Serves the SPA homepage; client JS resolves
+    the slug to a persisted audit. Reserved words and audit-prefixed paths
+    are excluded so explicit routes are never shadowed."""
+    if slug in _RESERVED_SLUGS or slug.startswith('audit'):
+        raise HTTPException(status_code=404, detail='not found')
+    return HTMLResponse(INDEX_HTML)
 
 
 if __name__ == '__main__':

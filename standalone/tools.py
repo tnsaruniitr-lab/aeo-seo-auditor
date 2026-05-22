@@ -511,6 +511,150 @@ def persist_audit(audit_data: Dict[str, Any]) -> Dict[str, Any]:
                 "audit_id": audit_id, "findings_persisted": 0}
 
 
+def _supabase_base_headers():
+    """Return (base_url, headers) for Supabase REST, or (None, None) if env
+    vars are unset. Shared by persist_audit (write) and fetch_audit (read)."""
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
+    if not (supabase_url and supabase_key):
+        return None, None
+    base = supabase_url.rstrip("/")
+    for suffix in ("/rest/v1", "/rest"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+    base = base.rstrip("/")
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+    }
+    return base, headers
+
+
+def fetch_audit(domain: Optional[str] = None,
+                audit_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Fetch a persisted audit from Supabase and reassemble it into the full
+    audit-JSON shape — the exact shape run_audit_agent produces and the
+    homepage renderFull() expects.
+
+    Provide exactly one of:
+        domain   — returns the LATEST audit for that domain
+        audit_id — returns that specific audit
+
+    Returns the audit dict, or None if not found / Supabase not configured.
+    """
+    base, headers = _supabase_base_headers()
+    if base is None:
+        return None
+
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    if audit_id:
+        params = {"audit_id": f"eq.{audit_id}", "limit": "1"}
+    elif domain:
+        params = {"domain": f"eq.{domain}",
+                  "order": "created_at.desc", "limit": "1"}
+    else:
+        return None
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(f"{base}/rest/v1/website_audits",
+                            headers=headers, params=params)
+            if r.status_code != 200:
+                return None
+            rows = r.json()
+            if not rows:
+                return None
+            row = rows[0]
+
+            fr = client.get(f"{base}/rest/v1/website_audit_findings",
+                            headers=headers,
+                            params={"audit_id": f"eq.{row['audit_id']}",
+                                    "order": "id.asc"})
+            findings = fr.json() if fr.status_code == 200 else []
+    except Exception:
+        return None
+
+    # Reassemble into the canonical audit-JSON shape renderFull() consumes.
+    return {
+        "audit_id": row.get("audit_id"),
+        "url": row.get("url"),
+        "domain": row.get("domain"),
+        "date": row.get("audit_date"),
+        "duration_seconds": row.get("duration_seconds"),
+        "classification": {
+            "page_type": row.get("page_type"),
+            "industry": row.get("industry"),
+            "company_name": row.get("company_name"),
+            "confidence": row.get("confidence"),
+        },
+        "context": {
+            "competitors": row.get("competitors"),
+            "test_queries": row.get("test_queries"),
+        },
+        "gates": row.get("gates"),
+        "scoring": {
+            "section_scores": row.get("section_scores"),
+            "page_citation_readiness": row.get("page_citation_readiness"),
+            "brand_ai_presence": row.get("brand_ai_presence"),
+            "seo_score": row.get("seo_score"),
+            "aeo_score": row.get("aeo_score"),
+            "citation_readiness": row.get("citation_readiness"),
+            "overall_score": row.get("overall_score"),
+            "overall_grade": row.get("overall_grade"),
+        },
+        "narrative": row.get("narrative"),
+        "competitor_comparison": row.get("competitor_comparison"),
+        "bots_eye_view": row.get("bots_eye_view"),
+        "performance": row.get("performance"),
+        "supplementary_findings": row.get("supplementary_findings"),
+        "metadata": row.get("metadata"),
+        "findings_count": row.get("findings_count"),
+        "findings": [
+            {
+                "check_id": f.get("check_id"),
+                "section": f.get("section"),
+                "status": f.get("status"),
+                "severity": f.get("severity"),
+                "evidence": f.get("evidence"),
+                "truth_badge": f.get("truth_badge"),
+                "fix_type": f.get("fix_type"),
+                "citations": f.get("citations"),
+            }
+            for f in findings
+        ],
+        "loaded_from": "supabase",
+        "created_at": row.get("created_at"),
+    }
+
+
+def list_audits_for_domain(domain: str, limit: int = 10) -> list:
+    """Return a compact list of past audits for a domain (newest first) —
+    audit_id, score, grade, date — for the 'previous audits' UI."""
+    base, headers = _supabase_base_headers()
+    if base is None:
+        return []
+    try:
+        import httpx
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(
+                f"{base}/rest/v1/website_audits",
+                headers=headers,
+                params={"domain": f"eq.{domain}",
+                        "select": "audit_id,overall_score,overall_grade,"
+                                  "audit_date,created_at,findings_count",
+                        "order": "created_at.desc",
+                        "limit": str(limit)},
+            )
+            return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
 # ============================================================================
 # TOOL DISPATCH TABLE — used by agent.py
 # ============================================================================
