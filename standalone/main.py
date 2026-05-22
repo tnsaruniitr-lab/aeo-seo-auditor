@@ -994,6 +994,9 @@ def healthz():
             'agent_import_error': None if AGENT_AVAILABLE else _AGENT_IMPORT_ERROR,
             'web_tools': 'anthropic_native_server_tools',
             'auth_enabled': AUTH_ENABLED,
+            'supabase_configured': bool(
+                os.getenv('SUPABASE_URL') and os.getenv('SUPABASE_SERVICE_KEY')
+            ),
             'output_dir': str(OUTPUT_DIR),
         }
     except Exception as e:
