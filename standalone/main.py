@@ -70,10 +70,11 @@ sys.path.insert(0, str(THIS_DIR))
 
 import secrets
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
+from typing import List as _List  # avoid clash with the Optional/Dict already imported
 
 from audit_pipeline import run_audit as run_audit_deterministic
 
@@ -206,6 +207,39 @@ if not AUTH_ENABLED:
                 'Service is publicly accessible. Set both in Railway to enable auth.')
 else:
     log.info('AUTH enabled for user=%s', AUDIT_USERNAME)
+
+# API key auth — for server-to-server integrations (AnswerMonk, etc.)
+# Set in Railway: AUDIT_API_KEY env var. Independent of Basic Auth above.
+AUDIT_API_KEY = os.getenv('AUDIT_API_KEY', '')
+API_KEY_ENABLED = bool(AUDIT_API_KEY)
+
+if not API_KEY_ENABLED:
+    log.warning('API KEY AUTH DISABLED — AUDIT_API_KEY env var not set. '
+                'Programmatic endpoints /api/audit/* are unauthenticated.')
+
+
+def require_api_key(request: Request):
+    """Verify X-API-Key header against env-var-defined AUDIT_API_KEY.
+
+    If API_KEY_ENABLED is False (env var unset), allows all requests
+    (same safety design as require_auth — never silently lock out).
+    Constant-time comparison.
+    """
+    if not API_KEY_ENABLED:
+        return True
+    key = request.headers.get('X-API-Key', '')
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Missing X-API-Key header',
+        )
+    if not secrets.compare_digest(key, AUDIT_API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Invalid API key',
+        )
+    return True
+
 
 _basic = HTTPBasic(auto_error=False)
 
@@ -1158,6 +1192,7 @@ def healthz():
             'agent_import_error': None if AGENT_AVAILABLE else _AGENT_IMPORT_ERROR,
             'web_tools': 'anthropic_native_server_tools',
             'auth_enabled': AUTH_ENABLED,
+            'api_key_enabled': API_KEY_ENABLED,
             'supabase_configured': bool(
                 os.getenv('SUPABASE_URL') and os.getenv('SUPABASE_SERVICE_KEY')
             ),
@@ -1205,6 +1240,31 @@ async def submit_audit(req: AuditRequest, background_tasks: BackgroundTasks,
     )
 
 
+def _maybe_fire_webhook(audit_id: str):
+    """If this audit was started with a webhookUrl, POST the compact result
+    (or failure payload) to it. Best-effort, no retries — pollers fall back."""
+    with JOBS_LOCK:
+        job = dict(JOBS.get(audit_id) or {})
+    webhook_url = job.get('webhook_url')
+    if not webhook_url:
+        return
+    status_ = job.get('status')
+    if status_ == 'completed':
+        result = job.get('result') or {}
+        payload = _audit_to_compact(result) if isinstance(result, dict) else {}
+        payload['status'] = 'complete'
+    elif status_ == 'error':
+        payload = {
+            'status': 'failed',
+            'auditId': audit_id,
+            'reason': job.get('error') or 'audit failed',
+            'agentErrors': job.get('agent_errors') or [],
+        }
+    else:
+        return  # mid-flight — don't fire
+    _send_webhook(webhook_url, payload)
+
+
 def _run_audit_background(audit_id: str, url: str):
     """Background runner — invoked via FastAPI background_tasks."""
     sid = audit_id[:8]
@@ -1248,6 +1308,7 @@ def _run_audit_background(audit_id: str, url: str):
                 JOBS[audit_id]['input_tokens'] = result.get('input_tokens')
                 JOBS[audit_id]['output_tokens'] = result.get('output_tokens')
                 JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
+            _maybe_fire_webhook(audit_id)
             return
 
         score = (result.get('scoring') or {}).get('overall_score') if isinstance(result, dict) else None
@@ -1257,6 +1318,7 @@ def _run_audit_background(audit_id: str, url: str):
             JOBS[audit_id]['status'] = 'completed'
             JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
             JOBS[audit_id]['result'] = result
+        _maybe_fire_webhook(audit_id)
     except Exception as e:
         elapsed = round(time.time() - started, 1)
         # Full traceback to stdout — Railway captures it in the log viewer.
@@ -1268,6 +1330,7 @@ def _run_audit_background(audit_id: str, url: str):
             JOBS[audit_id]['error'] = f'{type(e).__name__}: {e}'
             JOBS[audit_id]['traceback'] = traceback.format_exc()
             JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
+        _maybe_fire_webhook(audit_id)
 
 
 @app.get('/audit/{audit_id}', response_model=AuditStatusResponse)
@@ -1513,6 +1576,344 @@ def api_history(domain: str):
 def api_audits(_: bool = Depends(require_auth)):
     """All persisted audits, newest first — powers the homepage library grid."""
     return {'audits': list_all_audits()}
+
+
+# ======================================================================
+# PROGRAMMATIC API — for server-to-server integrations (AnswerMonk, etc.)
+# All routes here require X-API-Key (set as AUDIT_API_KEY in Railway).
+# Clean contract: 3 endpoints, idempotent start, never-lies status, compact
+# result + ?full=1 escape hatch, optional webhook on completion.
+# ======================================================================
+
+# Section letter → human-readable category, for compact result mapping
+_SECTION_LABELS = {
+    'A': 'Technical SEO', 'B': 'Performance', 'C': 'On-Page SEO',
+    'D': 'Schema', 'E': 'AEO Discovery', 'F': 'AEO Extraction',
+    'G': 'AEO Trust', 'H': 'AEO Selection', 'I': 'GEO',
+    'J': 'Entity Consistency',
+}
+
+# Idempotency window — same URL within this many seconds returns same audit_id
+_IDEMPOTENCY_WINDOW_SECONDS = 60
+
+
+class StartAuditRequest(BaseModel):
+    url: str
+    webhookUrl: Optional[str] = None
+
+
+class StartAuditResponse(BaseModel):
+    auditId: str
+    estimatedSeconds: int
+    reused: bool
+
+
+def _normalize_url(raw: str) -> str:
+    """Auto-prepend https:// when a bare domain is passed (e.g. 'feelvaleo.com')."""
+    s = (raw or '').strip()
+    if not s:
+        return s
+    if s.startswith('//'):
+        return 'https:' + s
+    if not s.lower().startswith(('http://', 'https://')):
+        return 'https://' + s
+    return s
+
+
+def _find_recent_audit_for_url(url: str) -> Optional[str]:
+    """Idempotency check — return an existing audit_id for `url` if one was
+    submitted within the last _IDEMPOTENCY_WINDOW_SECONDS seconds and is
+    queued, running, or recently completed. Otherwise None.
+
+    Checks in-memory JOBS first (covers in-flight audits), then Supabase
+    (covers completed audits that finished within the window)."""
+    cutoff = time.time() - _IDEMPOTENCY_WINDOW_SECONDS
+    with JOBS_LOCK:
+        for aid, j in JOBS.items():
+            if j.get('url') != url:
+                continue
+            started = j.get('_submitted_at') or 0
+            if started < cutoff:
+                continue
+            # Skip outright failures — let the caller try again
+            if j.get('status') == 'error':
+                continue
+            return aid
+    # Supabase fallback for completed audits within the window
+    try:
+        domain = re.sub(r'^https?://', '', url).rstrip('/').split('/')[0]
+        recents = list_audits_for_domain(domain, limit=3)
+        from datetime import datetime as _dt
+        for r in recents:
+            created = r.get('created_at') or ''
+            if not created:
+                continue
+            try:
+                # Postgres returns ISO with offset; parse leniently
+                ts = _dt.fromisoformat(created.replace('Z', '+00:00')).timestamp()
+            except Exception:
+                continue
+            if ts >= cutoff:
+                return r.get('audit_id')
+    except Exception:
+        pass
+    return None
+
+
+def _derive_progress_pct(job: Dict) -> int:
+    """Rough 0–100 progress for status polling. Based on tool_count;
+    typical complete audit emits ~28 tool calls."""
+    status_ = job.get('status', 'queued')
+    if status_ == 'completed':
+        return 100
+    if status_ == 'error':
+        return 0
+    if status_ == 'queued':
+        return 2
+    p = (job.get('progress') or {})
+    tc = p.get('tool_count') or 0
+    return max(5, min(95, int(tc / 30 * 95)))
+
+
+def _public_status(job: Dict, in_supabase: bool) -> str:
+    """Map internal JOBS status to the public 5-state enum."""
+    s = job.get('status', 'queued') if job else None
+    if s == 'queued':    return 'pending'
+    if s == 'running':   return 'running'
+    if s == 'completed': return 'complete'
+    if s == 'error':     return 'failed'
+    if in_supabase:      return 'complete'  # persisted; in-mem evicted
+    return 'lost'
+
+
+def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
+    """Map the full audit dict to the compact result shape AnswerMonk
+    consumes for the third-segment card."""
+    if not audit:
+        return {}
+    scoring = audit.get('scoring', {}) or {}
+    findings = audit.get('findings', []) or []
+    failed_or_warn = [f for f in findings if f.get('status') in ('fail', 'warn')]
+    counts = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
+    for f in failed_or_warn:
+        sev = (f.get('severity') or 'medium').lower()
+        if sev in counts:
+            counts[sev] += 1
+
+    # Top issues sorted: critical → high → medium → low; fail before warn
+    sev_rank = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+    sorted_issues = sorted(failed_or_warn, key=lambda f: (
+        0 if f.get('status') == 'fail' else 1,
+        sev_rank.get((f.get('severity') or 'medium').lower(), 5),
+    ))
+
+    # Index top fixes by check_id for quicker "fix" hint lookup
+    narrative = audit.get('narrative', {}) or {}
+    fixes_by_topic = {}
+    for fx in (narrative.get('top_5_fixes') or []):
+        title_lc = (fx.get('title') or '').lower()
+        fixes_by_topic[title_lc] = (fx.get('after') or fx.get('title') or '')[:200]
+
+    issues = []
+    for f in sorted_issues[:20]:
+        section_letter = (f.get('section') or (f.get('check_id') or '')[:1]).upper()
+        evidence = f.get('evidence') or ''
+        # Title = first sentence/clause of evidence, capped
+        title = evidence.split('.')[0][:120] or f.get('check_id', 'Issue')
+        # Try to match a top fix by keyword
+        fix_hint = None
+        check_id_lc = (f.get('check_id') or '').lower()
+        for topic, after in fixes_by_topic.items():
+            if any(tok in topic for tok in check_id_lc.split('_') if len(tok) > 3):
+                fix_hint = (after.split('.')[0])[:160]
+                break
+        if not fix_hint:
+            fix_hint = (f.get('fix_type') or '').replace('_', ' ').title() or None
+
+        issues.append({
+            'severity': f.get('severity'),
+            'category': _SECTION_LABELS.get(section_letter, section_letter or 'General'),
+            'title': title,
+            'fix': fix_hint,
+            'checkId': f.get('check_id'),
+        })
+
+    total = len(failed_or_warn)
+    crit_high = counts['critical'] + counts['high']
+    summary = (f"{total} issue{'s' if total != 1 else ''} found — "
+               f"{crit_high} critical or high severity")
+
+    domain = audit.get('domain') or ''
+    # Build full report URL — prefer the request's host if available
+    if request is not None:
+        scheme = request.url.scheme
+        netloc = request.url.netloc
+        full_url = f"{scheme}://{netloc}/{domain}" if domain else None
+    else:
+        full_url = f"/{domain}" if domain else None
+
+    return {
+        'status': 'complete',
+        'auditId': audit.get('audit_id'),
+        'url': audit.get('url'),
+        'domain': domain,
+        'score': scoring.get('overall_score'),
+        'grade': scoring.get('overall_grade'),
+        'pageCitationReadiness': scoring.get('page_citation_readiness'),
+        'brandAiPresence': scoring.get('brand_ai_presence'),
+        'summary': summary,
+        'severityCounts': counts,
+        'issues': issues,
+        'executiveDiagnosis': narrative.get('executive_diagnosis'),
+        'fullReportUrl': full_url,
+        'completedAt': audit.get('date') or audit.get('created_at'),
+        'durationSeconds': audit.get('duration_seconds'),
+    }
+
+
+def _send_webhook(webhook_url: str, payload: Dict) -> None:
+    """Best-effort webhook POST. One attempt, 10s timeout, no retries —
+    AnswerMonk's polling is the fallback. Never raises."""
+    try:
+        import httpx
+        with httpx.Client(timeout=10.0) as client:
+            r = client.post(
+                webhook_url,
+                json=payload,
+                headers={'User-Agent': 'growthmonk-auditor/1.0',
+                         'Content-Type': 'application/json'},
+            )
+            log.info('webhook → %s status=%d audit_id=%s',
+                     webhook_url, r.status_code,
+                     payload.get('auditId', ''))
+    except Exception as e:
+        log.warning('webhook → %s failed: %s', webhook_url, e)
+
+
+@app.post('/api/audit/start', response_model=StartAuditResponse)
+async def api_audit_start(req: StartAuditRequest,
+                           background_tasks: BackgroundTasks,
+                           _: bool = Depends(require_api_key)):
+    """Server-to-server audit trigger.
+
+    Body: {url, webhookUrl?}
+    Auth: X-API-Key
+    Returns: {auditId, estimatedSeconds, reused}
+
+    Idempotent: same URL submitted within 60s returns the same auditId
+    with reused=true (prevents double-billing on retries / double-clicks).
+
+    If webhookUrl is provided, the auditor will POST the compact result
+    (or failure payload) to that URL when the audit settles. The webhook
+    is best-effort — clients should still implement polling as a fallback."""
+    url = _normalize_url(req.url)
+    if not url or '.' not in url:
+        raise HTTPException(status_code=400,
+                            detail='Invalid url — must be a domain or full URL')
+
+    existing = _find_recent_audit_for_url(url)
+    if existing:
+        log.info('[%s] idempotency hit for url=%s', existing[:8], url)
+        return StartAuditResponse(auditId=existing,
+                                   estimatedSeconds=180, reused=True)
+
+    audit_id = str(uuid.uuid4())
+    log.info('[%s] api/start url=%s webhook=%s', audit_id[:8], url,
+             '(yes)' if req.webhookUrl else '(no)')
+    with JOBS_LOCK:
+        JOBS[audit_id] = {
+            'audit_id': audit_id,
+            'status': 'queued',
+            'url': url,
+            'started_at': None,
+            'completed_at': None,
+            'result': None,
+            'error': None,
+            'webhook_url': req.webhookUrl,
+            'submitted_via': 'api',
+            '_submitted_at': time.time(),
+        }
+    background_tasks.add_task(_run_audit_background, audit_id, url)
+    return StartAuditResponse(auditId=audit_id, estimatedSeconds=180, reused=False)
+
+
+@app.get('/api/audit/{audit_id}/status')
+def api_audit_status(audit_id: str, _: bool = Depends(require_api_key)):
+    """Status of an audit — always returns 200 with one of 5 statuses:
+    pending | running | complete | failed | lost.
+
+    'lost' = the audit_id is unknown to both in-memory state AND Supabase.
+    This is the state your polling code should treat as 'give up silently'
+    (e.g., a Railway redeploy wiped state before Supabase captured it)."""
+    with JOBS_LOCK:
+        job = dict(JOBS.get(audit_id) or {})
+    # Confirm presence in Supabase if not in memory
+    in_supabase = False
+    if not job:
+        persisted = fetch_audit(audit_id=audit_id)
+        if persisted:
+            in_supabase = True
+            job = {'status': 'completed', 'result': persisted}
+
+    status_ = _public_status(job, in_supabase) if job else 'lost'
+    resp = {
+        'auditId': audit_id,
+        'status': status_,
+        'progressPct': _derive_progress_pct(job) if job else 0,
+    }
+    if job.get('progress'):
+        p = job['progress']
+        resp['phase'] = p.get('phase')
+        resp['elapsedSeconds'] = p.get('elapsed_seconds')
+        resp['toolCount'] = p.get('tool_count')
+    if status_ == 'failed':
+        resp['error'] = job.get('error')
+        if job.get('agent_errors'):
+            resp['agentErrors'] = job['agent_errors']
+    if status_ == 'complete':
+        resp['durationSeconds'] = job.get('result', {}).get('duration_seconds') \
+            if isinstance(job.get('result'), dict) else None
+    return resp
+
+
+@app.get('/api/audit/{audit_id}/result')
+def api_audit_result(audit_id: str, request: Request,
+                      full: int = 0, _: bool = Depends(require_api_key)):
+    """The audit result.
+
+    Default (?full not set, or full=0): compact shape — score, grade,
+    summary, issues[], fullReportUrl — sized for the card render.
+
+    ?full=1: the rich audit JSON (the same shape /api/by-id returns).
+
+    Never returns 4xx for a known but not-yet-complete audit — returns
+    200 with status='not_ready' so the polling loop stays simple.
+    Failures return 200 with status='failed'. Unknown audit_id returns 404."""
+    with JOBS_LOCK:
+        job = dict(JOBS.get(audit_id) or {})
+
+    audit_obj = None
+    if job:
+        result = job.get('result')
+        if isinstance(result, dict) and not result.get('error'):
+            audit_obj = result
+        elif job.get('status') == 'error':
+            return {'status': 'failed', 'auditId': audit_id,
+                    'reason': job.get('error') or 'audit failed',
+                    'agentErrors': job.get('agent_errors') or []}
+        elif job.get('status') in ('queued', 'running'):
+            return {'status': 'not_ready', 'auditId': audit_id,
+                    'progressPct': _derive_progress_pct(job)}
+
+    if audit_obj is None:
+        audit_obj = fetch_audit(audit_id=audit_id)
+
+    if audit_obj is None:
+        raise HTTPException(status_code=404, detail='audit not found')
+
+    if full:
+        return audit_obj
+    return _audit_to_compact(audit_obj, request=request)
 
 
 # ----------------------------------------------------------------------
