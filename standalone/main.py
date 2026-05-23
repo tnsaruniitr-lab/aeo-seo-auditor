@@ -522,7 +522,9 @@ INDEX_HTML = r"""<!doctype html>
   <div class="tagline">Full 97-check audit · Sieve brain (12,764 entries) · Claude Sonnet 4.6</div>
 
   <form id="f">
-    <input id="url" type="url" placeholder="https://example.com" required autofocus>
+    <input id="url" type="text" inputmode="url" autocomplete="url"
+           placeholder="example.com   (or https://example.com/page)"
+           required autofocus spellcheck="false" autocapitalize="off">
     <button id="go" type="submit">Run audit</button>
   </form>
 
@@ -539,10 +541,25 @@ INDEX_HTML = r"""<!doctype html>
 const $ = (id) => document.getElementById(id);
 const out = $('out');
 
+function normalizeUrl(raw) {
+  // Trim + auto-prepend https:// when the user types a bare domain like
+  // "feelvaleo.com" or "www.feelvaleo.com/path". Leaves explicit http:// /
+  // https:// untouched. Strips leading "//".
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  // Common paste artifacts: "http://https://..." or scheme typos
+  s = s.replace(/^\s+|\s+$/g, '');
+  if (/^https?:\/\//i.test(s)) return s;
+  if (s.startsWith('//')) return 'https:' + s;
+  return 'https://' + s;
+}
+
 $('f').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const url = $('url').value.trim();
+  const url = normalizeUrl($('url').value);
   if (!url) return;
+  // Reflect the normalized URL back in the field so the user sees what we sent
+  $('url').value = url;
   $('go').disabled = true;
   out.innerHTML = '<div class="status-card"><span class="status"><span class="spinner"></span>Submitting…</span></div>';
 
