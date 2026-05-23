@@ -1100,6 +1100,12 @@ function renderLibrary(audits) {
   // Strip leading/trailing slashes from the path. '' => homepage form + library.
   const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
   if (path) {
+    // Customer-facing view: hide the internal "Run audit" form and the
+    // library — show only the audit itself.
+    const form = document.getElementById('f');
+    const lib = document.getElementById('library');
+    if (form) form.style.display = 'none';
+    if (lib) lib.style.display = 'none';
     loadAuditByDomain(decodeURIComponent(path));
   } else {
     loadLibrary();
@@ -1323,10 +1329,10 @@ def get_audit(audit_id: str, _: bool = Depends(require_auth)):
 # Artifact endpoints use /audit/{id}/{format} (slash separator) to avoid
 # greedy-matching with the bare /audit/{id} route.
 @app.get('/audit/{audit_id}/json')
-def get_audit_json(audit_id: str, _: bool = Depends(require_auth)):
-    """Full audit JSON. Serves the on-disk file if the audit is still in
-    memory; otherwise falls back to Supabase (so old audit_ids survive
-    Railway redeploys)."""
+def get_audit_json(audit_id: str):
+    """Full audit JSON — PUBLIC so customers can download their report.
+    Serves the on-disk file if the audit is still in memory; otherwise
+    falls back to Supabase (so old audit_ids survive Railway redeploys)."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
     if job and job['status'] == 'completed':
@@ -1344,8 +1350,8 @@ def get_audit_json(audit_id: str, _: bool = Depends(require_auth)):
 
 
 @app.get('/audit/{audit_id}/md')
-def get_audit_markdown(audit_id: str, _: bool = Depends(require_auth)):
-    """Markdown audit report."""
+def get_audit_markdown(audit_id: str):
+    """Markdown audit report — PUBLIC for customer download."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
     if not job or job['status'] != 'completed':
@@ -1358,8 +1364,8 @@ def get_audit_markdown(audit_id: str, _: bool = Depends(require_auth)):
 
 
 @app.get('/audit/{audit_id}/pdf')
-def get_audit_pdf(audit_id: str, _: bool = Depends(require_auth)):
-    """1-page PDF summary."""
+def get_audit_pdf(audit_id: str):
+    """1-page PDF summary — PUBLIC for customer download."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
     if not job or job['status'] != 'completed':
@@ -1468,9 +1474,12 @@ def debug_persist_test(_: bool = Depends(require_auth)):
 # ----------------------------------------------------------------------
 
 @app.get('/api/by-domain/{domain:path}')
-def api_by_domain(domain: str, _: bool = Depends(require_auth)):
+def api_by_domain(domain: str):
     """Latest persisted audit for a domain, reassembled into the full
-    audit-JSON shape the homepage renderer consumes."""
+    audit-JSON shape the homepage renderer consumes.
+
+    PUBLIC — powers the customer-facing /{domain} page. Customers visit
+    the share link, the page JS calls this endpoint to fetch the audit."""
     audit = fetch_audit(domain=domain)
     if not audit:
         raise HTTPException(status_code=404,
@@ -1479,9 +1488,10 @@ def api_by_domain(domain: str, _: bool = Depends(require_auth)):
 
 
 @app.get('/api/by-id/{audit_id}')
-def api_by_id(audit_id: str, _: bool = Depends(require_auth)):
-    """A specific audit by id — checks in-memory JOBS first (freshest),
-    then falls back to Supabase (survives redeploys)."""
+def api_by_id(audit_id: str):
+    """A specific audit by id — PUBLIC for shareable specific-run links.
+    Checks in-memory JOBS first (freshest), then falls back to Supabase
+    (survives redeploys)."""
     with JOBS_LOCK:
         job = JOBS.get(audit_id)
     if job and job.get('result') and not job['result'].get('error'):
@@ -1493,8 +1503,9 @@ def api_by_id(audit_id: str, _: bool = Depends(require_auth)):
 
 
 @app.get('/api/history/{domain:path}')
-def api_history(domain: str, _: bool = Depends(require_auth)):
-    """Compact list of past audits for a domain (newest first)."""
+def api_history(domain: str):
+    """Compact list of past audits for a domain (newest first).
+    PUBLIC — for the "previous audits" section on customer-facing pages."""
     return {'domain': domain, 'audits': list_audits_for_domain(domain)}
 
 
@@ -1518,10 +1529,14 @@ _RESERVED_SLUGS = {
 
 
 @app.get('/{slug}', response_class=HTMLResponse)
-def slug_page(slug: str, _: bool = Depends(require_auth)):
-    """Catch-all for /{domain}. Serves the SPA homepage; client JS resolves
-    the slug to a persisted audit. Reserved words and audit-prefixed paths
-    are excluded so explicit routes are never shadowed."""
+def slug_page(slug: str):
+    """Catch-all for /{domain} — PUBLIC. This is the customer-facing audit
+    view: share audits.growthmonk.ai/{their-domain} and they can see the
+    audit without an auth prompt. Serves the SPA homepage; client JS
+    resolves the slug to a persisted audit via /api/by-domain.
+
+    Reserved words and audit-prefixed paths are excluded so explicit
+    routes (which may still be auth-gated) are never shadowed."""
     if slug in _RESERVED_SLUGS or slug.startswith('audit'):
         raise HTTPException(status_code=404, detail='not found')
     return HTMLResponse(INDEX_HTML)
