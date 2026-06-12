@@ -15,8 +15,7 @@ USAGE
     result = run_audit_agent("https://example.com", output_dir="./audits/")
 
 ENV
-    ANTHROPIC_API_KEY     required
-    TAVILY_API_KEY        required for web_search
+    ANTHROPIC_API_KEY     required (web_search/web_fetch use Anthropic server tools)
     SUPABASE_URL/KEY      optional for persist_audit
 """
 
@@ -54,6 +53,7 @@ MODEL = "claude-sonnet-4-6"
 # Sonnet 4.6 supports up to 64K output tokens.
 MAX_TOKENS_PER_TURN = 32768
 MAX_AGENT_TURNS = 80              # hard cap on tool-use iterations
+MAX_PAUSE_TURNS = 10             # cap consecutive server-tool pause_turn continuations
 MAX_TOOL_RESULT_BYTES = 50_000     # truncate big tool outputs (e.g. raw scripts JSON)
 # Total time budget per audit. Bumped 480s → 900s after excellage.ae
 # hit 480s at turn 8 with all the WORK done (just ran out before the
@@ -149,6 +149,7 @@ def run_agent_loop(url: str, verbose: bool = False,
     raw_final_text = ""
     stop_reason = "unknown"
     turns = 0
+    pause_turns = 0
 
     started = time.time()
     pfx = log_prefix or ''
@@ -263,6 +264,22 @@ def run_agent_loop(url: str, verbose: bool = False,
                            '', turns, len(tool_call_log))
             break
 
+        # Anthropic server tools (web_search / web_fetch) can pause a long turn
+        # with stop_reason='pause_turn'. The correct response is to resend the
+        # conversation so the model continues — the assistant turn is already
+        # appended above, so just loop again. Cap consecutive pauses so a
+        # misbehaving turn can't spin forever.
+        if stop_reason == "pause_turn":
+            pause_turns += 1
+            log.info('%spause_turn at turn=%d (#%d) — continuing', pfx, turns, pause_turns)
+            if pause_turns > MAX_PAUSE_TURNS:
+                msg = f"exceeded MAX_PAUSE_TURNS={MAX_PAUSE_TURNS} at turn {turns}"
+                errors.append(msg)
+                log.warning('%s%s', pfx, msg)
+                break
+            continue
+        pause_turns = 0
+
         if stop_reason != "tool_use":
             msg = f"unexpected stop_reason '{stop_reason}' at turn {turns}"
             errors.append(msg)
@@ -291,12 +308,20 @@ def run_agent_loop(url: str, verbose: bool = False,
                           traceback.format_exc())
             elapsed_ms = int((time.time() - t0) * 1000)
 
-            # Truncate huge results to keep context tractable
+            # Keep context tractable. Prefer structure-aware shrinking (drop
+            # known-bulky, low-signal keys) over a blind byte-slice, which
+            # would hand the model syntactically broken JSON of its own
+            # foundational data.
             result_str = json.dumps(result, default=str, ensure_ascii=False)
             if len(result_str) > MAX_TOOL_RESULT_BYTES:
+                slim = _slim_tool_result(name, result)
+                result_str = json.dumps(slim, default=str, ensure_ascii=False)
+            if len(result_str) > MAX_TOOL_RESULT_BYTES:
+                # Still oversize — byte-slice as a last resort, but signal it.
                 result_str = (
                     result_str[:MAX_TOOL_RESULT_BYTES]
-                    + f'... [truncated {len(result_str) - MAX_TOOL_RESULT_BYTES} bytes]'
+                    + f'... [truncated {len(result_str) - MAX_TOOL_RESULT_BYTES} bytes — '
+                    f'JSON intentionally incomplete]'
                 )
 
             had_error = "error" in (result if isinstance(result, dict) else {})
@@ -343,12 +368,34 @@ def run_agent_loop(url: str, verbose: bool = False,
         errors.append(msg)
         log.warning('%s%s', pfx, msg)
 
-    audit = _extract_audit_json(raw_final_text, errors)
+    audit, from_tag = _extract_audit_json(raw_final_text, errors)
+
+    # Only accept the audit if the model actually finished (end_turn). When
+    # the loop broke on budget / turn-cap / error, raw_final_text is the last
+    # INTERMEDIATE message; a stray parseable JSON fragment there must not be
+    # promoted to a "completed" audit and persisted. The explicit <audit> tag
+    # is the only trustworthy signal of a deliberate final emission.
+    if audit is not None and stop_reason != "end_turn" and not from_tag:
+        errors.append(
+            f"discarding loosely-parsed JSON: loop exited stop_reason='{stop_reason}' "
+            f"without an <audit> tag — not a deliberate final audit")
+        log.warning('%s%s', pfx, errors[-1])
+        audit = None
+
+    # Structural validation — a hollow object missing scoring/findings is not
+    # a usable audit; route it to the error envelope rather than persisting it.
+    if audit is not None:
+        missing = _audit_missing_fields(audit)
+        if missing:
+            errors.append(f"extracted audit missing required fields: {', '.join(missing)}")
+            log.warning('%s%s', pfx, errors[-1])
+            audit = None
+
     if audit is not None:
         log.info('%sextracted audit JSON (%d top-level keys, %dB raw)',
                  pfx, len(audit), len(json.dumps(audit, default=str)))
     else:
-        log.error('%sfailed to extract audit JSON. raw_final_text len=%d preview=%s',
+        log.error('%sfailed to extract usable audit JSON. raw_final_text len=%d preview=%s',
                   pfx, len(raw_final_text), raw_final_text[:300].replace('\n', ' \\n '))
 
     log.info('%sloop done turns=%d stop=%s tokens=%d+%d errors=%d',
@@ -386,21 +433,63 @@ def _short(d: Dict[str, Any], max_len: int = 80) -> str:
     return s[:max_len] + ("..." if len(s) > max_len else "")
 
 
+def _slim_tool_result(name: str, result: Any) -> Any:
+    """Shrink an oversize tool result by dropping bulky, low-signal keys while
+    preserving valid JSON and every decision-relevant field. The big offender
+    is the deterministic-scripts output, whose sitemap URL list and per-probe
+    raw blobs dwarf the actual check verdicts."""
+    if not isinstance(result, dict):
+        return result
+    slim = dict(result)
+    sm = slim.get('sitemap_analysis')
+    if isinstance(sm, dict) and isinstance(sm.get('sitemap_urls'), list):
+        sm = dict(sm)
+        n = len(sm['sitemap_urls'])
+        sm['sitemap_urls'] = sm['sitemap_urls'][:20]
+        sm['sitemap_urls_truncated'] = {'shown': min(20, n), 'total': n}
+        slim['sitemap_analysis'] = sm
+    # Per-probe HTML/raw fields are not present in the contract, but cloaking
+    # delta arrays and reference dumps can be large — trim defensively.
+    bev = slim.get('bots_eye_view')
+    if isinstance(bev, dict) and isinstance(bev.get('cloaking_deltas'), list) \
+            and len(bev['cloaking_deltas']) > 8:
+        bev = dict(bev)
+        bev['cloaking_deltas'] = bev['cloaking_deltas'][:8]
+        slim['bots_eye_view'] = bev
+    return slim
+
+
 _AUDIT_TAG_RE = re.compile(r"<audit>\s*(\{.*?\})\s*</audit>", re.DOTALL)
 
 
-def _extract_audit_json(text: str, errors: List[str]) -> Optional[Dict[str, Any]]:
-    """Pull the JSON object from the final assistant text. Robust to:
-       - <audit>{...}</audit> tags (preferred)
-       - bare {...} JSON if tags missing
-       - markdown ```json fences
+_REQUIRED_AUDIT_FIELDS = ("scoring", "findings")
+
+
+def _audit_missing_fields(audit: Dict[str, Any]) -> List[str]:
+    """Return the required top-level fields absent or wrong-typed in `audit`.
+    A usable audit must carry a scoring dict and a findings list."""
+    missing = []
+    if not isinstance(audit.get("scoring"), dict):
+        missing.append("scoring")
+    if not isinstance(audit.get("findings"), list):
+        missing.append("findings")
+    return missing
+
+
+def _extract_audit_json(text: str, errors: List[str]):
+    """Pull the JSON object from the final assistant text.
+
+    Returns (audit_dict_or_None, from_tag). `from_tag` is True only when the
+    JSON came from an explicit <audit>...</audit> wrapper — the caller treats
+    the loose fallbacks as untrustworthy unless the loop ended on end_turn.
     """
     if not text:
         errors.append("no final text to parse")
-        return None
+        return None, False
 
     m = _AUDIT_TAG_RE.search(text)
     candidate = m.group(1) if m else None
+    from_tag = candidate is not None
 
     if candidate is None:
         # Fallback 1: strip ```json fences
@@ -417,13 +506,13 @@ def _extract_audit_json(text: str, errors: List[str]) -> Optional[Dict[str, Any]
 
     if candidate is None:
         errors.append("no JSON object found in final text")
-        return None
+        return None, False
 
     try:
-        return json.loads(candidate)
+        return json.loads(candidate), from_tag
     except json.JSONDecodeError as e:
         errors.append(f"final JSON parse failed: {e}")
-        return None
+        return None, False
 
 
 # -----------------------------------------------------------------------------

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -77,6 +78,7 @@ from pydantic import BaseModel, HttpUrl, Field
 from typing import List as _List  # avoid clash with the Optional/Dict already imported
 
 from audit_pipeline import run_audit as run_audit_deterministic
+from safety import check_url_safe
 
 # Agent-mode (full parity with the chat skill) is opt-in via AUDIT_MODE env var.
 # Default is "agent" once the parity layer is deployed; falls back automatically
@@ -140,6 +142,50 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # For multi-instance scale, swap for Redis or DB.
 JOBS: Dict[str, Dict] = {}
 JOBS_LOCK = threading.Lock()
+
+# Resource bounds. Audits spawn chromium + run the agent loop; without a cap,
+# concurrent submissions exhaust memory/CPU. We bound queued+running audits
+# and evict old finished jobs so JOBS can't grow without limit.
+MAX_CONCURRENT_AUDITS = int(os.getenv('MAX_CONCURRENT_AUDITS', '3'))
+MAX_TRACKED_JOBS = int(os.getenv('MAX_TRACKED_JOBS', '500'))
+# A running audit older than this is considered hung and reaped to 'error'
+# so it can't hold a slot / sit in 'running' forever.
+MAX_AUDIT_SECONDS = int(os.getenv('MAX_AUDIT_SECONDS', '1200'))
+
+# Fail-closed switch: in production a missing auth env var must NOT silently
+# expose the expensive/mutating endpoints. Detected via Railway's injected
+# vars, or forced with AUDITOR_FAIL_CLOSED=1. Local dev (no signal) stays open.
+IS_PRODUCTION = bool(
+    os.getenv('RAILWAY_GIT_COMMIT_SHA') or os.getenv('RAILWAY_ENVIRONMENT')
+    or os.getenv('AUDITOR_FAIL_CLOSED') == '1'
+)
+
+
+def _active_audit_count() -> int:
+    """Count queued+running jobs. Caller must hold JOBS_LOCK."""
+    return sum(1 for j in JOBS.values()
+               if j.get('status') in ('queued', 'running'))
+
+
+def _reap_and_evict_locked() -> None:
+    """Reap hung 'running' jobs and evict old finished ones. Holds JOBS_LOCK."""
+    now = time.time()
+    # Reap hung audits
+    for aid, j in JOBS.items():
+        if j.get('status') == 'running':
+            sub = j.get('_submitted_at') or 0
+            if sub and now - sub > MAX_AUDIT_SECONDS:
+                j['status'] = 'error'
+                j['error'] = f'audit exceeded {MAX_AUDIT_SECONDS}s wall-clock; reaped'
+                j['completed_at'] = datetime.now(timezone.utc).isoformat()
+    # Evict oldest finished jobs over the cap
+    if len(JOBS) > MAX_TRACKED_JOBS:
+        finished = [(j.get('_submitted_at') or 0, aid)
+                    for aid, j in JOBS.items()
+                    if j.get('status') in ('completed', 'error')]
+        finished.sort()
+        for _, aid in finished[:len(JOBS) - MAX_TRACKED_JOBS]:
+            JOBS.pop(aid, None)
 
 
 # ----------------------------------------------------------------------
@@ -1007,11 +1053,12 @@ function renderBrainSources(findings) {
       const idTag = (c.id != null && c.id !== '' && !isNaN(c.id))
         ? ' <code style="font-size:11px">[Sieve ' + kind + ' #' + escapeHtml(String(c.id)) + ']</code>'
         : '';
+      const safeUrl = c.source_url ? safeHref(c.source_url) : '';
       html += '<div class="citation">' +
         '<span class="src">' + escapeHtml(c.source_org || 'unknown') + '</span> — ' +
-        (c.source_url ? '<a href="' + escapeHtml(c.source_url) + '" target="_blank" rel="noopener">' : '') +
+        (safeUrl ? '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' : '') +
         '<span class="nm">' + escapeHtml(name) + '</span>' +
-        (c.source_url ? '</a>' : '') +
+        (safeUrl ? '</a>' : '') +
         conf + risk + idTag +
         '</div>';
     }
@@ -1046,6 +1093,19 @@ function formatBlock(text) {
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Only allow http(s) hrefs. Citation source_url is model/page-derived, so a
+// 'javascript:'/'data:' scheme would execute in this origin when clicked.
+// Returns a safe href string, or '' when the scheme isn't http(s).
+function safeHref(u) {
+  try {
+    const parsed = new URL(String(u), window.location.origin);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return escapeHtml(parsed.href);
+    }
+  } catch (e) { /* malformed URL → no link */ }
+  return '';
 }
 
 // ---- Slug routing: audits.growthmonk.ai/{domain} ----------------------
@@ -1171,44 +1231,63 @@ def api_info(_: bool = Depends(require_auth)):
     }
 
 
+def _brain_ok() -> bool:
+    """Verify the brain snapshots load. Imports are module-load-safe."""
+    from ranker import BrainIndex
+    BrainIndex.from_export_dir(str(THIS_DIR.parent / 'auditor-ruleset-export'))
+    return True
+
+
 @app.get('/healthz')
 def healthz():
-    """Liveness/readiness check. Verifies brain snapshots load."""
+    """Public liveness check — minimal surface. Returns 200 when the brain
+    loads. Does NOT expose auth/config posture (that was a 'service is wide
+    open' beacon); the detailed readiness lives behind auth at /readyz."""
     try:
-        sys.path.insert(0, str(THIS_DIR.parent / 'auditor-ruleset-export'))
-        from ranker import BrainIndex
-        brain = BrainIndex.from_export_dir(
-            str(THIS_DIR.parent / 'auditor-ruleset-export')
-        )
-        stats = brain.stats()
-        api_key_set = bool(os.getenv('ANTHROPIC_API_KEY'))
+        _brain_ok()
         return {
             'status': 'ok',
             'brain_loaded': True,
-            'brain_stats': stats,
-            'anthropic_key_set': api_key_set,
-            'audit_mode': AUDIT_MODE,
-            'agent_available': AGENT_AVAILABLE,
-            'agent_import_error': None if AGENT_AVAILABLE else _AGENT_IMPORT_ERROR,
-            'web_tools': 'anthropic_native_server_tools',
-            'auth_enabled': AUTH_ENABLED,
-            'api_key_enabled': API_KEY_ENABLED,
-            'supabase_configured': bool(
-                os.getenv('SUPABASE_URL') and os.getenv('SUPABASE_SERVICE_KEY')
-            ),
-            'output_dir': str(OUTPUT_DIR),
-            # Railway injects the deployed commit; lets callers verify which
-            # build is live without a dashboard login.
+            # Public on GitHub already; lets callers verify the live build.
             'git_sha': os.getenv('RAILWAY_GIT_COMMIT_SHA'),
         }
     except Exception as e:
         return JSONResponse(
             status_code=503,
-            content={
-                'status': 'degraded',
-                'error': f'{type(e).__name__}: {e}',
-            },
+            content={'status': 'degraded', 'error': f'{type(e).__name__}: {e}'},
         )
+
+
+@app.get('/readyz')
+def readyz(_: bool = Depends(require_auth)):
+    """Authenticated detailed readiness — config posture, brain stats,
+    diagnostics. Gated so it can't be used to fingerprint the deployment."""
+    try:
+        from ranker import BrainIndex
+        stats = BrainIndex.from_export_dir(
+            str(THIS_DIR.parent / 'auditor-ruleset-export')).stats()
+    except Exception as e:
+        return JSONResponse(status_code=503,
+                            content={'status': 'degraded', 'error': f'{type(e).__name__}: {e}'})
+    return {
+        'status': 'ok',
+        'brain_stats': stats,
+        'anthropic_key_set': bool(os.getenv('ANTHROPIC_API_KEY')),
+        'audit_mode': AUDIT_MODE,
+        'agent_available': AGENT_AVAILABLE,
+        'agent_import_error': None if AGENT_AVAILABLE else _AGENT_IMPORT_ERROR,
+        'web_tools': 'anthropic_native_server_tools',
+        'auth_enabled': AUTH_ENABLED,
+        'api_key_enabled': API_KEY_ENABLED,
+        'is_production': IS_PRODUCTION,
+        'supabase_configured': bool(
+            os.getenv('SUPABASE_URL') and os.getenv('SUPABASE_SERVICE_KEY')),
+        'output_dir': str(OUTPUT_DIR),
+        'active_audits': sum(1 for j in JOBS.values()
+                             if j.get('status') in ('queued', 'running')),
+        'tracked_jobs': len(JOBS),
+        'git_sha': os.getenv('RAILWAY_GIT_COMMIT_SHA'),
+    }
 
 
 @app.post('/audit', response_model=AuditResponse)
@@ -1218,11 +1297,29 @@ async def submit_audit(req: AuditRequest, background_tasks: BackgroundTasks,
 
     Poll GET /audit/{id} for status. Typical completion: 60-120 seconds.
     """
+    # Fail closed: in production, a missing auth config must not leave this
+    # paid, chromium-spawning endpoint open to the internet.
+    if IS_PRODUCTION and not AUTH_ENABLED:
+        raise HTTPException(status_code=503,
+                            detail='Auth not configured; submission disabled')
+
     audit_id = str(uuid.uuid4())
     url_str = str(req.url)
+
+    # SSRF guard — refuse internal / metadata / non-http(s) targets.
+    safe, reason = check_url_safe(url_str)
+    if not safe:
+        log.warning('[%s] rejected unsafe url=%s (%s)', audit_id[:8], url_str, reason)
+        raise HTTPException(status_code=400, detail=f'URL not allowed: {reason}')
+
     log.info('[%s] submitted url=%s mode=%s', audit_id[:8], url_str, AUDIT_MODE)
 
     with JOBS_LOCK:
+        _reap_and_evict_locked()
+        if _active_audit_count() >= MAX_CONCURRENT_AUDITS:
+            raise HTTPException(
+                status_code=429,
+                detail=f'Too many audits in progress (max {MAX_CONCURRENT_AUDITS}); retry shortly')
         JOBS[audit_id] = {
             'audit_id': audit_id,
             'status': 'queued',
@@ -1231,6 +1328,7 @@ async def submit_audit(req: AuditRequest, background_tasks: BackgroundTasks,
             'completed_at': None,
             'result': None,
             'error': None,
+            '_submitted_at': time.time(),
         }
 
     background_tasks.add_task(_run_audit_background, audit_id, url_str)
@@ -1809,16 +1907,44 @@ async def api_audit_start(req: StartAuditRequest,
     If webhookUrl is provided, the auditor will POST the compact result
     (or failure payload) to that URL when the audit settles. The webhook
     is best-effort — clients should still implement polling as a fallback."""
+    # Fail closed in production when the API key isn't configured.
+    if IS_PRODUCTION and not API_KEY_ENABLED:
+        raise HTTPException(status_code=503,
+                            detail='API key not configured; endpoint disabled')
+
     url = _normalize_url(req.url)
     if not url or '.' not in url:
         raise HTTPException(status_code=400,
                             detail='Invalid url — must be a domain or full URL')
 
+    # SSRF guard for the audit target.
+    safe, reason = check_url_safe(url)
+    if not safe:
+        log.warning('rejected unsafe api url=%s (%s)', url, reason)
+        raise HTTPException(status_code=400, detail=f'URL not allowed: {reason}')
+
+    # SSRF guard for the webhook callback — an API-key holder must not be able
+    # to make the server POST to internal services.
+    if req.webhookUrl:
+        wsafe, wreason = check_url_safe(req.webhookUrl)
+        if not wsafe:
+            raise HTTPException(status_code=400,
+                                detail=f'webhookUrl not allowed: {wreason}')
+
+    # Idempotency first — a retry/double-click for an in-flight URL returns the
+    # existing audit and must NOT be rejected by the concurrency gate below.
     existing = _find_recent_audit_for_url(url)
     if existing:
         log.info('[%s] idempotency hit for url=%s', existing[:8], url)
         return StartAuditResponse(auditId=existing,
                                    estimatedSeconds=180, reused=True)
+
+    with JOBS_LOCK:
+        _reap_and_evict_locked()
+        if _active_audit_count() >= MAX_CONCURRENT_AUDITS:
+            raise HTTPException(
+                status_code=429,
+                detail=f'Too many audits in progress (max {MAX_CONCURRENT_AUDITS}); retry shortly')
 
     audit_id = str(uuid.uuid4())
     log.info('[%s] api/start url=%s webhook=%s', audit_id[:8], url,

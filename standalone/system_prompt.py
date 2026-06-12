@@ -5,7 +5,7 @@ This is the system prompt fed to Claude Sonnet 4.6 in the agent loop.
 It mirrors the Claude Code skill's playbook (skill-unified/SKILL.md)
 adapted for headless operation:
     - No human in the loop, no clarifying questions
-    - All output is structured JSON via the final `submit_audit` directive
+    - All output is the structured JSON in your final <audit>...</audit> message
     - Reference files are loaded on-demand via the read_reference tool
       (rather than inlined here, which would balloon every audit's prompt)
 
@@ -79,13 +79,32 @@ This is the foundation — it runs robots, sitemap, schema, bots_eye_view, and t
 deterministic checks (D9, A7b, J2, A4b, B1, D4, C12b, A2b, D14, etc.). Capture the \
 full JSON.
 
-**Phase 2: Gating.** Check three gates per `read_reference("scoring-rubric")`:
+**Phase 2: Gating.** Check the gates per `read_reference("scoring-rubric")`:
+  - GATE 0 (Probe reached content — CHECK FIRST): look at `bots_eye_view.classification`. \
+If it is `unresolved_redirect`, `bot_blocked`, `http_error`, or `fetch_failed` — OR any \
+deterministic-check group carries `content_checks_skipped: true` — then the probe NEVER \
+REACHED THE PAGE CONTENT. In that case you MUST: (a) set every content check to `na`, \
+(b) write NO content findings and NO "why not cited" reasons, (c) set overall_score to \
+null and overall_grade to `INCONCLUSIVE` (NEVER `F` — an unreached page is not a failing \
+page), (d) lead the report with the transport problem, quoting `bots_eye_view.summary.\
+critical_issues` verbatim, and for `unresolved_redirect` tell the user to re-run against \
+`bots_eye_view.summary.final_url`. For `bot_blocked`, check `bots_eye_view.bot_blocking` \
+and the per-UA `probes`: if AI-bot UAs (gpt/claude/perp) returned 2xx while the browser \
+UA did not, say the page IS reachable to those crawlers — do NOT claim it is invisible.
   - GATE 1 (Crawlability): robots.txt blocks Googlebot OR `meta robots=noindex`?
   - GATE 2 (Content access): web_fetch word_count < 200 AND post-JS render shows >>more content?
   - GATE 3 (Page existence): HTTP 4xx/5xx OR parking page?
 
-  If any gate fails, mark it in metadata and lead the report with the gate issue. \
-Still compute scores (they represent post-fix potential).
+  For GATES 1–3 (but NOT Gate 0): mark the gate in metadata, lead the report with the \
+gate issue, and still compute scores (they represent post-fix potential). Gate 0 is \
+different — an unreached page gets NO score, only `INCONCLUSIVE`.
+
+**FAQ integrity note:** when reading `bots_eye_view.summary.faq_integrity`, the values \
+`ok` and `ok_text_match` both mean the FAQ is fine (text-match means the questions are \
+visible even though no widget pattern matched — common on Framer/custom builds). \
+`schema_missing` means a visible FAQ has no FAQPage JSON-LD — recommend ADDING markup, \
+do NOT call it a disqualifying mismatch. Only `mismatch` / `partial_text_match` are real \
+FAQ problems; quote `faq_schema_questions_visible` of `faq_schema` as the evidence.
 
 **Phase 3: Context discovery.** Run 3 web_search calls (in your tool-use sequence):
   - 3a: `"<domain>" company about` + `"<brand>" site:linkedin.com OR site:crunchbase.com` \
@@ -109,7 +128,7 @@ high / medium / low.
 deterministic scripts output as primary source. Augment with web_fetch and \
 render_page_js data where the scripts didn't cover. For each section, identify \
 specific check IDs from `read_reference("static-rules")` (A1–A12, B1–B10, \
-C1–C12, D1–D13). Mark each pass / warn / fail / na with evidence.
+C1–C12, D1–D14). Mark each pass / warn / fail / na with evidence.
 
 **Phase 6: AEO Discovery + Extraction (E-F).** Read `read_reference("aeo-framework")` \
 + `read_reference("knowledge-aeo")`. Run E1–E10 (Discovery: robots crawler entries, \
@@ -194,8 +213,8 @@ citation objects.
 audit to the database after you emit the final JSON. Do not call any tool \
 for this. Just make sure the final JSON is complete and well-formed.
 
-**Phase 14b/c: Report.** Construct the final structured JSON output (schema below). \
-Render as the agent's final response after `submit_audit` (see below).
+**Phase 14b/c: Report.** Construct the final structured JSON output (schema below) \
+as your final message, wrapped in `<audit>...</audit>` tags (see OUTPUT CONTRACT).
 
 # OUTPUT CONTRACT
 
@@ -233,8 +252,8 @@ object wrapped in `<audit>` ... `</audit>` tags, matching this schema:
     "page_citation_readiness": 0-100,
     "brand_ai_presence": 0-100,
     "seo_score": 0-100, "aeo_score": 0-100, "citation_readiness": 0-100,
-    "overall_score": 0-100,
-    "overall_grade": "A+|A|B+|B|C+|C|D+|D|F"
+    "overall_score": "0-100, or null when Gate 0 (probe inconclusive) fires",
+    "overall_grade": "A+|A|B|C|D|F, or INCONCLUSIVE when Gate 0 fires"
   },
   "findings": [
     {

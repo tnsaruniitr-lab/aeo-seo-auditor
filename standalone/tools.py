@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -210,23 +211,43 @@ def run_deterministic_scripts(url: str, timeout: int = 180) -> Dict[str, Any]:
     if not DETERMINISTIC_SCRIPT.exists():
         return {"error": f"Script not found: {DETERMINISTIC_SCRIPT}"}
 
+    # Run in its own process group so a timeout can kill the ENTIRE subtree.
+    # run_deterministic.sh backgrounds 5 child scripts (curl/python3); a plain
+    # subprocess.run(timeout=) kills only the direct bash child, leaving curl
+    # grandchildren orphaned and — because they inherit the stdout pipe — can
+    # block the parent's reaping past the deadline. killpg cleans them all up.
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["bash", str(DETERMINISTIC_SCRIPT), url],
-            capture_output=True, text=True, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
         )
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.communicate()
+        except (ProcessLookupError, PermissionError):
+            pass
         return {"error": f"timed out after {timeout}s"}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
     try:
-        return json.loads(proc.stdout)
+        return json.loads(stdout)
     except json.JSONDecodeError as e:
         return {
             "error": f"JSON parse: {e}",
-            "stdout_first_2000": proc.stdout[:2000],
-            "stderr_first_2000": proc.stderr[:2000],
+            "stdout_first_2000": (stdout or "")[:2000],
+            "stderr_first_2000": (stderr or "")[:2000],
         }
 
 
@@ -467,15 +488,12 @@ def persist_audit(audit_data: Dict[str, Any]) -> Dict[str, Any]:
             inserted = r.json()
             row_id = inserted[0].get("id") if inserted else None
 
-            # 2. Insert findings (batch). Replace any existing rows for this
-            #    audit_id first so a re-persist doesn't duplicate.
+            # 2. Insert findings (batch). Insert FIRST, then delete the older
+            #    rows only after the new insert succeeds — so a failed insert
+            #    can't leave 0 findings behind a non-zero findings_count
+            #    (the table never ends up emptier than it started).
             findings_persisted = 0
             if findings:
-                client.delete(
-                    f"{base}/rest/v1/website_audit_findings",
-                    headers=headers,
-                    params={"audit_id": f"eq.{audit_id}"},
-                )
                 findings_rows = [
                     {
                         "audit_id": audit_id,
@@ -490,15 +508,34 @@ def persist_audit(audit_data: Dict[str, Any]) -> Dict[str, Any]:
                     }
                     for f in findings
                 ]
+                # Tag this insert generation so we can delete only the rows
+                # that existed BEFORE it, leaving the just-inserted rows intact.
                 fr = client.post(
                     f"{base}/rest/v1/website_audit_findings",
-                    headers={**headers, "Prefer": "return=minimal"},
+                    headers={**headers, "Prefer": "return=representation"},
                     json=findings_rows,
                 )
                 if fr.status_code in (200, 201):
+                    try:
+                        new_ids = [row.get("id") for row in fr.json()
+                                   if isinstance(row, dict) and row.get("id") is not None]
+                    except Exception:
+                        new_ids = []
                     findings_persisted = len(findings_rows)
+                    # Remove prior rows for this audit_id, excluding the ones we
+                    # just inserted. If we couldn't read the new ids, skip the
+                    # delete entirely rather than risk deleting the fresh rows.
+                    if new_ids:
+                        id_list = ','.join(str(i) for i in new_ids)
+                        client.delete(
+                            f"{base}/rest/v1/website_audit_findings",
+                            headers=headers,
+                            params={"audit_id": f"eq.{audit_id}",
+                                    "id": f"not.in.({id_list})"},
+                        )
                 else:
-                    # Audit row saved; findings failed — report partial success
+                    # Audit row saved; findings failed — report partial success.
+                    # We did NOT delete anything, so prior findings (if any) stay.
                     return {"persisted": True, "supabase_row_id": row_id,
                             "audit_id": audit_id, "findings_persisted": 0,
                             "error": f"findings insert status {fr.status_code}: "

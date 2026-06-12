@@ -32,6 +32,7 @@ RUNTIME
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -42,6 +43,47 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# Bot's-Eye-View classifications that mean the probe never reached real
+# page content. A page in one of these states must NOT be scored or have
+# content findings written about it — the redirect-incident failure mode.
+TRANSPORT_CLASSES = frozenset({
+    'unresolved_redirect', 'bot_blocked', 'http_error', 'fetch_failed',
+})
+
+
+def bev_summary(scripts_output: Dict) -> Dict:
+    """Read the Bot's-Eye-View analyzer's ACTUAL output contract.
+
+    The analyzer (_bev_analyze.py) emits a `summary` block plus per-UA
+    `probes`; it has never emitted `page_identity` / `content_visible_to_bots`
+    / `response_per_bot`. Reading those phantom keys silently yielded empty
+    data (and a false "FAQ visible: 0" in every report). This helper is the
+    single source of truth for the real fields.
+    """
+    bev = scripts_output.get('bots_eye_view') or {}
+    summary = bev.get('summary') or {}
+    probes = bev.get('probes') or {}
+    default_probe = probes.get('default') or {}
+    return {
+        'classification': bev.get('classification'),
+        'is_transport_inconclusive': bev.get('classification') in TRANSPORT_CLASSES,
+        'visible_words': summary.get('visible_words_default'),
+        'h1_first': default_probe.get('h1_first'),
+        'http_code': summary.get('http_code_default'),
+        'final_url': summary.get('final_url'),
+        'redirects_followed': summary.get('redirects_followed'),
+        'faq_visible': summary.get('faq_visible'),
+        'faq_schema': summary.get('faq_schema'),
+        'faq_schema_questions_visible': summary.get('faq_schema_questions_visible'),
+        'faq_integrity': summary.get('faq_integrity'),
+        'same_html_as_404_url': summary.get('same_html_as_404_url'),
+        'soft_404_redirect': summary.get('soft_404_redirect'),
+        'cloaking_detected': summary.get('cloaking_detected'),
+        'bot_blocking_detected': summary.get('bot_blocking_detected'),
+        'critical_issues': summary.get('critical_issues') or [],
+        'spa_signals': summary.get('spa_signals') or [],
+    }
 
 # Add the ruleset export to import path
 THIS_DIR = Path(__file__).resolve().parent
@@ -120,22 +162,27 @@ def classify_page_from_scripts(scripts_output: Dict, url: str) -> Dict:
     This is a lightweight classifier — uses deterministic signals only.
     A heavier classifier (LLM-based) could be added later.
     """
-    bev = scripts_output.get('bots_eye_view', {})
-    page_id = bev.get('page_identity', {})
+    bev = bev_summary(scripts_output)
     schema = scripts_output.get('schema_completeness', {})
 
-    title = (page_id.get('title') or '').lower()
-    h1 = (page_id.get('h1_first') or '').lower()
+    # The analyzer emits no page title; H1 lives on the default probe.
+    h1 = (bev.get('h1_first') or '').lower()
+    title = h1  # best available proxy for keyword signals
     schema_types = []
     for ent in schema.get('entities', []):
         t = ent.get('type', '')
         if isinstance(t, str):
             schema_types.append(t.lower())
 
-    # URL-based signal
+    # URL-based signal: root = no path beyond '/'. Path-based beats a TLD
+    # suffix list (which missed .dev/.xyz and broke on ports/query strings).
     url_lower = url.lower()
-    is_root = url_lower.rstrip('/').endswith(('.com', '.de', '.io', '.app',
-                                               '.co', '.net', '.org', '.ai'))
+    try:
+        from urllib.parse import urlparse
+        _path = urlparse(url_lower).path or '/'
+        is_root = _path in ('', '/')
+    except Exception:
+        is_root = url_lower.rstrip('/').count('/') <= 2
 
     # Page type heuristic
     if 'blogposting' in schema_types or 'article' in schema_types or '/blog/' in url_lower:
@@ -255,6 +302,41 @@ def call_sonnet_for_narrative(
           'tokens_used': int,
         }
     """
+    bev = bev_summary(scripts_output)
+
+    # Transport-inconclusive probe: the page content was never reached, so
+    # there is nothing to diagnose. Return a fixed, honest narrative WITHOUT
+    # calling the model (and regardless of whether the API key is set) instead
+    # of asking it to invent reasons a page "isn't cited".
+    if bev['is_transport_inconclusive']:
+        cls = bev['classification']
+        reason = {
+            'unresolved_redirect': (
+                f"The page did not resolve to final content — it is still redirecting "
+                f"(HTTP {bev.get('http_code')}) after following redirects. "
+                f"Re-run the audit against the final URL ({bev.get('final_url') or 'unknown'})."),
+            'bot_blocked': (
+                f"The site returned HTTP {bev.get('http_code')} to the audit client, "
+                f"blocking access. Crawler-specific results may differ — see the probe table."),
+            'http_error': (
+                f"The page returned HTTP {bev.get('http_code')}; the analyzed response was an "
+                f"error page, not the live content."),
+            'fetch_failed': (
+                "The page could not be fetched (connection error or timeout); no content "
+                "could be analyzed."),
+        }.get(cls, "The page probe was inconclusive; no content could be analyzed.")
+        return {
+            'executive_diagnosis': (
+                f"Audit inconclusive — {reason} No content, schema, or AEO findings can be "
+                f"reported until the page is reachable."),
+            'why_not_cited': [],
+            'top_5_fixes': [],
+            'quick_wins': [],
+            'summary_what_to_do': reason,
+            'inconclusive': True,
+            'tokens_used': 0,
+        }
+
     try:
         from anthropic import Anthropic
     except ImportError:
@@ -282,15 +364,23 @@ def call_sonnet_for_narrative(
 
     client = Anthropic(api_key=api_key)
 
-    # Compact context payload for the LLM
+    # Compact context payload for the LLM — read the analyzer's REAL keys.
     context = {
         'url': url,
         'classification': classification,
-        'visible_words': scripts_output.get('bots_eye_view', {}).get(
-            'content_visible_to_bots', {}).get('visible_word_count'),
-        'classification_label': scripts_output.get('bots_eye_view', {}).get('classification'),
+        'visible_words': bev['visible_words'],
+        'classification_label': bev['classification'],
+        'h1': bev['h1_first'],
+        'faq': {
+            'visible': bev['faq_visible'],
+            'schema': bev['faq_schema'],
+            'schema_questions_visible': bev['faq_schema_questions_visible'],
+            'integrity': bev['faq_integrity'],
+        },
+        'bot_blocking_detected': bev['bot_blocking_detected'],
+        'cloaking_detected': bev['cloaking_detected'],
+        'probe_critical_issues': bev['critical_issues'],
         'overall_summary': scripts_output.get('overall_summary', {}),
-        'page_identity': scripts_output.get('bots_eye_view', {}).get('page_identity', {}),
         'top_findings': [
             {
                 'check_id': f['check_id'],
@@ -356,8 +446,11 @@ Output MUST be valid JSON matching this exact schema:
 }
 
 GUIDELINES:
-- 3 entries in "why_not_cited", exactly
-- 5 entries in "top_5_fixes", exactly (or fewer if findings limited)
+- Up to 3 entries in "why_not_cited" — ONLY reasons supported by the supplied \
+findings. If findings are thin, return fewer (even zero). Never invent a reason \
+that the findings do not support.
+- Up to 5 entries in "top_5_fixes", each tied to a specific finding (fewer if \
+findings are limited)
 - "citation_indexes" refer to position in top_findings[i].citations array
 - Be specific to the brand and page type. No generic advice.
 - Quote citation source names verbatim (e.g., "Per Schema.org's official documentation")
@@ -444,7 +537,12 @@ def compute_section_scores(scripts_output: Dict) -> Dict:
         sec = prefix.group(1)
         if sec not in counts:
             continue
-        counts[sec][check.get('status', 'na')] += 1
+        st = check.get('status', 'na')
+        # Tolerate any future/unknown status string instead of KeyError-ing
+        # the whole audit; only pass/warn/fail feed the score.
+        if st not in counts[sec]:
+            st = 'na'
+        counts[sec][st] += 1
 
     scores = {}
     for sec_letter, key in section_map.items():
@@ -471,23 +569,41 @@ def compute_section_scores(scripts_output: Dict) -> Dict:
         if v is not None:
             weighted += v * w
             weight_sum += w
-    scores['page_citation_readiness'] = (
-        round(weighted / weight_sum, 1) if weight_sum > 0 else 0
-    )
+    # Transport gate: if the probe never reached content (redirect loop,
+    # bot-blocked, HTTP error, fetch failure) OR no check was applicable,
+    # there is no basis for a numeric grade. Emitting 0/100 'F' here was the
+    # redirect-incident failure mode — a healthy-but-misprobed page scored F.
+    bev = bev_summary(scripts_output)
+    if bev['is_transport_inconclusive'] or weight_sum == 0:
+        scores['page_citation_readiness'] = None
+        return {
+            'section_scores': scores,
+            'section_counts': counts,
+            'overall_score': None,
+            'overall_grade': 'INCONCLUSIVE',
+            'inconclusive': True,
+            'inconclusive_reason': (
+                f"probe classification '{bev['classification']}'"
+                if bev['is_transport_inconclusive']
+                else 'no applicable checks (page content not reached)'),
+        }
 
+    scores['page_citation_readiness'] = round(weighted / weight_sum, 1)
+
+    readiness = scores['page_citation_readiness']
     grade = (
-        'A+' if scores['page_citation_readiness'] >= 95 else
-        'A' if scores['page_citation_readiness'] >= 85 else
-        'B' if scores['page_citation_readiness'] >= 75 else
-        'C' if scores['page_citation_readiness'] >= 65 else
-        'D' if scores['page_citation_readiness'] >= 55 else
+        'A+' if readiness >= 95 else
+        'A' if readiness >= 85 else
+        'B' if readiness >= 75 else
+        'C' if readiness >= 65 else
+        'D' if readiness >= 55 else
         'F'
     )
 
     return {
         'section_scores': scores,
         'section_counts': counts,
-        'overall_score': scores['page_citation_readiness'],
+        'overall_score': readiness,
         'overall_grade': grade,
     }
 
@@ -504,9 +620,7 @@ def render_markdown_report(audit: Dict) -> str:
     scoring = audit['scoring']
     narrative = audit['narrative']
     findings = audit['findings']
-    bev = audit['scripts_output'].get('bots_eye_view', {})
-    page_id = bev.get('page_identity', {})
-    cvb = bev.get('content_visible_to_bots', {})
+    bev = bev_summary(audit['scripts_output'])
 
     md = []
     md.append(f"# SEO + AEO + GEO Audit Report\n")
@@ -525,7 +639,13 @@ def render_markdown_report(audit: Dict) -> str:
     md.append("")
 
     md.append("## Scores\n")
-    md.append(f"### Page Citation Readiness: {scoring['overall_score']}% ({scoring['overall_grade']})\n")
+    if scoring.get('overall_score') is None:
+        md.append(f"### Page Citation Readiness: INCONCLUSIVE\n")
+        md.append(f"> The page probe was inconclusive "
+                  f"({scoring.get('inconclusive_reason', 'content not reached')}); "
+                  f"no score can be assigned until the page is reachable.\n")
+    else:
+        md.append(f"### Page Citation Readiness: {scoring['overall_score']}% ({scoring['overall_grade']})\n")
     md.append("| Section | Score |")
     md.append("|---|---|")
     for k, v in scoring['section_scores'].items():
@@ -543,18 +663,30 @@ def render_markdown_report(audit: Dict) -> str:
         md.append(item.get('body', ''))
         md.append("")
 
+    def _cell(v):
+        return 'n/a' if v is None else v
+
     md.append("## Bot's Eye View\n")
     md.append("| Metric | Value | Source |")
     md.append("|---|---|---|")
-    md.append(f"| Visible word count | {cvb.get('visible_word_count', 'n/a')} | curl |")
-    md.append(f"| Schema blocks | {cvb.get('schema_block_count', 'n/a')} | curl HTML parse |")
-    md.append(f"| Title | {page_id.get('title', 'n/a')} | curl |")
-    md.append(f"| H1 | {page_id.get('h1_first', 'n/a')} | curl |")
-    md.append(f"| Canonical | {page_id.get('canonical_tag', 'none')} | curl |")
-    md.append(f"| Meta robots | {page_id.get('meta_robots', 'none')} | curl |")
-    md.append(f"| FAQ visible | {cvb.get('faq_visible_pairs', 0)} | script |")
-    md.append(f"| FAQ in schema | {cvb.get('faq_schema_pairs', 0)} | script |")
-    md.append(f"| Classification | {bev.get('classification', 'n/a')} | script |")
+    md.append(f"| Classification | {_cell(bev['classification'])} | script |")
+    md.append(f"| HTTP status (default UA) | {_cell(bev['http_code'])} | curl |")
+    if bev['redirects_followed']:
+        md.append(f"| Final URL after redirects | {_cell(bev['final_url'])} | curl |")
+    md.append(f"| Visible word count | {_cell(bev['visible_words'])} | curl |")
+    md.append(f"| H1 | {_cell(bev['h1_first'])} | curl |")
+    md.append(f"| FAQ visible (widget) | {_cell(bev['faq_visible'])} | script |")
+    md.append(f"| FAQ in schema | {_cell(bev['faq_schema'])} | script |")
+    md.append(f"| FAQ schema questions in HTML | {_cell(bev['faq_schema_questions_visible'])} | script |")
+    md.append(f"| FAQ integrity | {_cell(bev['faq_integrity'])} | script |")
+    md.append(f"| Same HTML as 404 URL | {_cell(bev['same_html_as_404_url'])} | script |")
+    md.append(f"| Bot UA blocking detected | {_cell(bev['bot_blocking_detected'])} | script |")
+    md.append(f"| Cloaking detected | {_cell(bev['cloaking_detected'])} | script |")
+    if bev['critical_issues']:
+        md.append("")
+        md.append("**Probe critical issues:**")
+        for ci in bev['critical_issues']:
+            md.append(f"- {ci}")
     md.append("")
 
     md.append("## Top 5 Fixes\n")
@@ -625,25 +757,28 @@ def render_pdf_summary(audit: Dict, output_path: Path) -> Optional[Path]:
     narrative = audit['narrative']
     scoring = audit['scoring']
 
+    def esc(v):
+        return html.escape(str(v if v is not None else ''))
+
     issues_rows = ''
     for f in audit['findings'][:8]:
         sev = f.get('severity', 'medium')
         sev_class = {'critical': 'crit', 'high': 'high',
                      'medium': 'med', 'low': 'low'}.get(sev, 'low')
         issues_rows += (
-            f'<tr><td class="num">{f["check_id"]}</td>'
-            f'<td>{f["evidence"][:180]}</td>'
-            f'<td class="tag {sev_class}">{sev}</td></tr>'
+            f'<tr><td class="num">{esc(f.get("check_id"))}</td>'
+            f'<td>{esc((f.get("evidence") or "")[:180])}</td>'
+            f'<td class="tag {sev_class}">{esc(sev)}</td></tr>'
         )
 
     fixes_rows = ''
     for fix in narrative.get('top_5_fixes', [])[:5]:
         fixes_rows += (
-            f'<li><strong>{fix.get("title")}</strong> '
-            f'<em>({fix.get("impact")} impact, {fix.get("effort")} effort)</em></li>'
+            f'<li><strong>{esc(fix.get("title"))}</strong> '
+            f'<em>({esc(fix.get("impact"))} impact, {esc(fix.get("effort"))} effort)</em></li>'
         )
 
-    html = f"""<!doctype html>
+    html_doc = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{audit["domain"]} Audit Summary</title>
 <style>
 @page {{ size: A4; margin: 10mm 12mm; }}
@@ -672,11 +807,11 @@ li {{ margin: 1px 0; }}
 .footer {{ margin-top: 8px; font-size: 7.5pt; color: #94a3b8;
            text-align: center; border-top: 1px solid #e5e7eb; padding-top: 4px; }}
 </style></head><body>
-<h1>{audit["domain"]} — AI Visibility Audit</h1>
-<div class="subtitle">{audit["classification"]["page_type"]} · {audit["date"]} · Audit ID: <code>{audit["audit_id"][:8]}</code></div>
+<h1>{esc(audit["domain"])} — AI Visibility Audit</h1>
+<div class="subtitle">{esc(audit["classification"]["page_type"])} · {esc(audit["date"])} · Audit ID: <code>{esc(audit["audit_id"][:8])}</code></div>
 <div class="score-band">
-  <span class="score">{scoring["overall_score"]} / 100</span> · Grade {scoring["overall_grade"]}
-  &nbsp;|&nbsp; <span style="color:#334155">{narrative.get("executive_diagnosis","")[:200]}</span>
+  <span class="score">{'INCONCLUSIVE' if scoring.get('overall_score') is None else esc(scoring['overall_score']) + ' / 100'}</span> · Grade {esc(scoring["overall_grade"])}
+  &nbsp;|&nbsp; <span style="color:#334155">{esc(narrative.get("executive_diagnosis","")[:200])}</span>
 </div>
 <h2>Top issues</h2>
 <table><thead><tr><th>Check</th><th>Issue</th><th>Severity</th></tr></thead>
@@ -684,11 +819,11 @@ li {{ margin: 1px 0; }}
 <h2>Top 5 fixes</h2>
 <ol>{fixes_rows}</ol>
 <h2>Honest framing</h2>
-<p>{narrative.get("summary_what_to_do","")[:600]}</p>
+<p>{esc(narrative.get("summary_what_to_do","")[:600])}</p>
 <div class="footer">Generated by aeo-seo-auditor standalone v4.0 · model: {ANTHROPIC_MODEL}</div>
 </body></html>"""
 
-    html_path.write_text(html)
+    html_path.write_text(html_doc)
     pdf_path = output_path.with_suffix('.pdf')
     try:
         subprocess.run([

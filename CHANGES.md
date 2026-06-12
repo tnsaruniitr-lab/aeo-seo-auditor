@@ -337,3 +337,67 @@ classification `fully_accessible`, 27/27 checks run, and only genuine
 findings (1 of 6 FAQ questions not visible, FAQPage missing @id, no Person
 schema, 0/90 sitemap lastmod). reddit.com correctly reports bot blocking
 (gbot/gpt 403, claude 429) instead of "cloaking".
+
+---
+
+# 2026-06-12 — Production-service hardening (standalone/)
+
+First audit of the FastAPI service itself (standalone/main.py + agent/pipeline
+layers). Security + report-integrity fixes; deploys via the same Railway build.
+
+## Security (standalone/main.py + new standalone/safety.py)
+- SSRF guard (`safety.check_url_safe`): submission and webhook URLs are now
+  rejected when they target loopback/RFC1918/link-local/reserved/multicast
+  addresses, cloud-metadata IPs (169.254.169.254 etc.), `localhost`, embedded
+  credentials, or non-http(s) schemes — resolving DNS and checking every
+  returned address. Blocks the "audit http://169.254.169.254/ and read it back
+  from the public audit JSON" exfiltration.
+- Fail-closed auth: in production (Railway env detected, or AUDITOR_FAIL_CLOSED=1)
+  a missing AUDIT_USERNAME/PASSWORD or AUDIT_API_KEY now returns 503 on the
+  paid submission endpoints instead of silently serving them to everyone.
+- Concurrency cap (MAX_CONCURRENT_AUDITS, default 3): submissions past the cap
+  get 429 instead of spawning unbounded chromium/agent loops. JOBS is bounded
+  (MAX_TRACKED_JOBS) with oldest-finished eviction, and hung 'running' jobs are
+  reaped to 'error' after MAX_AUDIT_SECONDS so they can't hold a slot forever.
+- /healthz no longer leaks auth/config posture (was an "auth_enabled:false"
+  beacon); detailed readiness moved to an auth-gated /readyz. git_sha kept on
+  /healthz for deploy verification.
+- `javascript:`/`data:` scheme XSS in the report renderer's citation links
+  fixed with a client-side `safeHref()` (http/https only).
+- Added the missing `import re` that silently NameError'd the Supabase
+  idempotency path (every retry was re-running/re-billing the audit).
+
+## Report integrity (audit_pipeline.py, agent.py, system_prompt.py, tools.py)
+- Transport gate: a probe classified `unresolved_redirect` / `bot_blocked` /
+  `http_error` / `fetch_failed`, or with no applicable checks, now scores
+  `INCONCLUSIVE` (overall_score null) instead of the old 0/100 Grade F — the
+  redirect-incident failure mode at the scoring layer. The narrative for such
+  pages is a fixed honest statement (no LLM call), not three fabricated
+  "why not cited" reasons; the "exactly 3" instruction is now "up to 3, only
+  when findings support it". system_prompt.py gains GATE 0 teaching the agent
+  the same rule.
+- Phantom-key fixes via a single `bev_summary()` reader: classification,
+  narrative context, and the markdown Bot's-Eye-View table now read the
+  analyzer's REAL keys (summary.visible_words_default, summary.faq_*, probes.
+  default.h1_first) instead of `page_identity`/`content_visible_to_bots`,
+  which never existed and made every report print "FAQ visible: 0" and 'n/a'
+  word counts. FAQ integrity legend (ok_text_match/schema_missing) documented.
+- agent.py: `pause_turn` from server tools now continues the loop instead of
+  aborting the audit; a budget/turn-cap exit no longer promotes intermediate
+  chatter to a "completed" audit (only an explicit <audit> tag on a clean
+  end_turn is accepted, and a missing scoring/findings fails to the error
+  envelope); oversize tool results are structure-trimmed before a last-resort
+  byte-slice.
+- tools.py: run_deterministic_scripts runs the script subtree in its own
+  process group and killpg's it on timeout (no more orphaned curl children
+  hanging past the deadline); findings persist is insert-then-delete so a
+  failed insert can't leave 0 findings behind a non-zero findings_count.
+- Scoring tolerates unknown check statuses instead of KeyError-ing the audit;
+  PDF/markdown renderers html.escape page-derived strings and handle a null
+  (INCONCLUSIVE) score.
+
+Verified: SSRF/fail-closed/concurrency/401 all fire via FastAPI TestClient;
+transport gate + phantom-key + narrative-gate unit tests pass; full
+deterministic pipeline on http://somana.com renders grade C/72 with a correct
+Bot's-Eye-View table (was Grade F with "FAQ visible: 0"). 37/37 script tests
+still green.
