@@ -715,6 +715,81 @@ def list_all_audits(limit: int = 60) -> list:
         return []
 
 
+def _domain_variants(domain: str) -> set:
+    """Normalize a domain and return the {bare, www} forms persist may have
+    stored (persist keeps whatever the URL host was, incl. a www. prefix)."""
+    d = (domain or "").strip().lower()
+    d = re.sub(r"^https?://", "", d).strip("/").split("/")[0]
+    bare = d[4:] if d.startswith("www.") else d
+    return {v for v in (bare, "www." + bare) if v and "." in v}
+
+
+def delete_audits(domain: Optional[str] = None,
+                  audit_id: Optional[str] = None) -> Dict[str, Any]:
+    """Delete persisted audit(s) from Supabase — findings first, then the
+    audit rows. Provide exactly one of `domain` (removes ALL audits for that
+    domain, www/bare) or `audit_id` (removes that one). Returns a summary
+    with the audit_ids removed and row counts. Never raises."""
+    base, headers = _supabase_base_headers()
+    if base is None:
+        return {"deleted": False, "error": "Supabase not configured"}
+    try:
+        import httpx
+    except ImportError:
+        return {"deleted": False, "error": "httpx not installed"}
+
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            # 1. Resolve the set of audit_ids to remove.
+            if audit_id:
+                target_ids = [audit_id]
+            elif domain:
+                variants = _domain_variants(domain)
+                if not variants:
+                    return {"deleted": False, "error": f"invalid domain '{domain}'"}
+                inlist = ",".join(f'"{v}"' for v in sorted(variants))
+                r = client.get(
+                    f"{base}/rest/v1/website_audits",
+                    headers=headers,
+                    params={"domain": f"in.({inlist})", "select": "audit_id"},
+                )
+                if r.status_code != 200:
+                    return {"deleted": False,
+                            "error": f"lookup failed: {r.status_code} {r.text[:200]}"}
+                target_ids = [row["audit_id"] for row in r.json()
+                              if row.get("audit_id")]
+            else:
+                return {"deleted": False, "error": "provide domain or audit_id"}
+
+            if not target_ids:
+                return {"deleted": True, "audit_ids": [], "audits_deleted": 0,
+                        "findings_deleted": 0, "note": "no matching audits"}
+
+            ids_in = ",".join(f'"{i}"' for i in target_ids)
+            rep = {**headers, "Prefer": "return=representation"}
+
+            # 2. Delete child findings, then 3. the audit rows.
+            fr = client.delete(f"{base}/rest/v1/website_audit_findings",
+                               headers=rep, params={"audit_id": f"in.({ids_in})"})
+            findings_deleted = (len(fr.json()) if fr.status_code in (200, 206)
+                                and fr.text.strip().startswith("[") else 0)
+
+            ar = client.delete(f"{base}/rest/v1/website_audits",
+                               headers=rep, params={"audit_id": f"in.({ids_in})"})
+            if ar.status_code not in (200, 204, 206):
+                return {"deleted": False,
+                        "error": f"audit delete failed: {ar.status_code} {ar.text[:200]}",
+                        "findings_deleted": findings_deleted}
+            audits_deleted = (len(ar.json()) if ar.status_code in (200, 206)
+                              and ar.text.strip().startswith("[") else len(target_ids))
+
+        return {"deleted": True, "audit_ids": target_ids,
+                "audits_deleted": audits_deleted,
+                "findings_deleted": findings_deleted}
+    except Exception as e:
+        return {"deleted": False, "error": f"{type(e).__name__}: {e}"}
+
+
 # ============================================================================
 # TOOL DISPATCH TABLE — used by agent.py
 # ============================================================================

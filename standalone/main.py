@@ -94,7 +94,8 @@ except Exception as _agent_import_err:
 
 # Supabase read path — for reloading persisted audits by domain or id.
 try:
-    from tools import fetch_audit, list_audits_for_domain, list_all_audits
+    from tools import (fetch_audit, list_audits_for_domain, list_all_audits,
+                       delete_audits)
 except Exception:
     def fetch_audit(*_a, **_k):  # type: ignore
         return None
@@ -102,6 +103,8 @@ except Exception:
         return []
     def list_all_audits(*_a, **_k):  # type: ignore
         return []
+    def delete_audits(*_a, **_k):  # type: ignore
+        return {"deleted": False, "error": "tools.delete_audits unavailable"}
 
 
 def run_audit(url: str, output_dir: str, progress_callback=None):
@@ -159,6 +162,70 @@ IS_PRODUCTION = bool(
     os.getenv('RAILWAY_GIT_COMMIT_SHA') or os.getenv('RAILWAY_ENVIRONMENT')
     or os.getenv('AUDITOR_FAIL_CLOSED') == '1'
 )
+
+
+# Suppression denylist — domains that must not be audited or re-published
+# (e.g. a brand that has formally objected / issued a takedown). Seeded from
+# the SUPPRESSED_DOMAINS env var (comma-separated, durable across redeploys);
+# a by-domain delete with suppress=1 also adds to it for the current process.
+def _registrable(domain: str) -> str:
+    """Normalize to a bare host: strip scheme, leading www., trailing slash."""
+    d = (domain or '').strip().lower()
+    d = re.sub(r'^https?://', '', d).strip('/').split('/')[0]
+    return d[4:] if d.startswith('www.') else d
+
+
+SUPPRESSED_DOMAINS = {
+    _registrable(d) for d in os.getenv('SUPPRESSED_DOMAINS', '').split(',')
+    if d.strip()
+}
+SUPPRESS_LOCK = threading.Lock()
+
+
+def _is_suppressed(url_or_domain: str) -> bool:
+    reg = _registrable(url_or_domain)
+    with SUPPRESS_LOCK:
+        return reg in SUPPRESSED_DOMAINS
+
+
+def _purge_local_artifacts(domain: Optional[str] = None,
+                           audit_id: Optional[str] = None) -> int:
+    """Delete on-disk audit artifacts (.json/.md/.pdf/.html) for a domain or
+    audit_id. Files are named '{slug}-{audit_id[:8]}.*' in OUTPUT_DIR."""
+    removed = 0
+    try:
+        if audit_id:
+            pattern = f'*-{audit_id[:8]}.*'
+        elif domain:
+            pattern = f'{_registrable(domain).replace(".", "-")}-*.*'
+        else:
+            return 0
+        for p in OUTPUT_DIR.glob(pattern):
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return removed
+
+
+def _purge_jobs(domain: Optional[str] = None,
+                audit_id: Optional[str] = None) -> int:
+    """Drop in-memory JOBS entries matching a domain or audit_id."""
+    removed = 0
+    with JOBS_LOCK:
+        if audit_id:
+            if JOBS.pop(audit_id, None) is not None:
+                removed += 1
+        elif domain:
+            reg = _registrable(domain)
+            for aid in [a for a, j in JOBS.items()
+                        if _registrable(j.get('url', '')) == reg]:
+                JOBS.pop(aid, None)
+                removed += 1
+    return removed
 
 
 def _active_audit_count() -> int:
@@ -1306,6 +1373,11 @@ async def submit_audit(req: AuditRequest, background_tasks: BackgroundTasks,
     audit_id = str(uuid.uuid4())
     url_str = str(req.url)
 
+    # Suppressed domain — a brand that has objected must not be re-audited.
+    if _is_suppressed(url_str):
+        raise HTTPException(status_code=403,
+                            detail='This domain has been suppressed and cannot be audited.')
+
     # SSRF guard — refuse internal / metadata / non-http(s) targets.
     safe, reason = check_url_safe(url_str)
     if not safe:
@@ -1917,6 +1989,11 @@ async def api_audit_start(req: StartAuditRequest,
         raise HTTPException(status_code=400,
                             detail='Invalid url — must be a domain or full URL')
 
+    # Suppressed domain — refuse to (re-)audit a brand that has objected.
+    if _is_suppressed(url):
+        raise HTTPException(status_code=403,
+                            detail='This domain has been suppressed and cannot be audited.')
+
     # SSRF guard for the audit target.
     safe, reason = check_url_safe(url)
     if not safe:
@@ -2043,6 +2120,92 @@ def api_audit_result(audit_id: str, request: Request,
     if full:
         return audit_obj
     return _audit_to_compact(audit_obj, request=request)
+
+
+# ----------------------------------------------------------------------
+# ADMIN: DELETE / SUPPRESS AUDITS
+# Removes a published audit from Supabase + disk + memory, and (optionally)
+# suppresses the domain so it can't be re-audited or re-published. Use for
+# takedown requests (a brand that objects under UWG/GDPR, etc.).
+# Gated by the API key; fail-closed in production when no key is configured.
+# ----------------------------------------------------------------------
+
+
+def _require_delete_auth():
+    """Destructive ops require the API key. In production a missing key
+    disables them entirely rather than leaving them open."""
+    if IS_PRODUCTION and not API_KEY_ENABLED:
+        raise HTTPException(status_code=503,
+                            detail='API key not configured; delete disabled')
+
+
+@app.delete('/api/audit/by-domain/{domain:path}')
+def delete_audit_by_domain(domain: str, suppress: int = 1,
+                           _: bool = Depends(require_api_key)):
+    """Delete ALL persisted audits for a domain (Supabase + disk + memory).
+
+    suppress=1 (default) also adds the domain to the in-process denylist so it
+    can't be re-audited/re-published until restart. For a durable block, add
+    the bare domain to the SUPPRESSED_DOMAINS env var on the host.
+    """
+    _require_delete_auth()
+    reg = _registrable(domain)
+    if not reg or '.' not in reg:
+        raise HTTPException(status_code=400, detail='invalid domain')
+
+    db_result = delete_audits(domain=reg)
+    files_removed = _purge_local_artifacts(domain=reg)
+    jobs_removed = _purge_jobs(domain=reg)
+
+    suppressed = False
+    if suppress:
+        with SUPPRESS_LOCK:
+            SUPPRESSED_DOMAINS.add(reg)
+        suppressed = True
+
+    log.warning('ADMIN delete domain=%s db=%s files=%d jobs=%d suppressed=%s',
+                reg, db_result, files_removed, jobs_removed, suppressed)
+    return {
+        'domain': reg,
+        'supabase': db_result,
+        'local_files_removed': files_removed,
+        'jobs_removed': jobs_removed,
+        'suppressed': suppressed,
+        'suppressed_note': ('Durable block: also add to SUPPRESSED_DOMAINS env var'
+                            if suppressed else None),
+    }
+
+
+@app.delete('/api/audit/{audit_id}')
+def delete_audit_by_id(audit_id: str, _: bool = Depends(require_api_key)):
+    """Delete a single audit by id (Supabase + disk + memory). Does not
+    suppress the domain — use the by-domain route for that."""
+    _require_delete_auth()
+    db_result = delete_audits(audit_id=audit_id)
+    files_removed = _purge_local_artifacts(audit_id=audit_id)
+    jobs_removed = _purge_jobs(audit_id=audit_id)
+    log.warning('ADMIN delete audit_id=%s db=%s files=%d jobs=%d',
+                audit_id, db_result, files_removed, jobs_removed)
+    return {'audit_id': audit_id, 'supabase': db_result,
+            'local_files_removed': files_removed, 'jobs_removed': jobs_removed}
+
+
+@app.get('/api/suppressed')
+def list_suppressed(_: bool = Depends(require_api_key)):
+    """List domains currently suppressed (env + in-process additions)."""
+    with SUPPRESS_LOCK:
+        return {'suppressed_domains': sorted(SUPPRESSED_DOMAINS)}
+
+
+@app.delete('/api/suppressed/{domain:path}')
+def unsuppress(domain: str, _: bool = Depends(require_api_key)):
+    """Remove a domain from the in-process denylist (does not affect the
+    SUPPRESSED_DOMAINS env var — edit that on the host for a durable change)."""
+    _require_delete_auth()
+    reg = _registrable(domain)
+    with SUPPRESS_LOCK:
+        SUPPRESSED_DOMAINS.discard(reg)
+    return {'domain': reg, 'suppressed': False}
 
 
 # ----------------------------------------------------------------------
