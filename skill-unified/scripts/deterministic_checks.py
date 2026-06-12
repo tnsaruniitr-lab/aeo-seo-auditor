@@ -38,6 +38,7 @@ import time
 import urllib.request
 import urllib.parse
 from urllib.error import URLError, HTTPError
+from html import unescape as html_unescape
 
 # Share the question-intent-gated FAQ detector with the BEV layer so Phase 2
 # counts the same thing Phase 1 does. Prior code had a duplicate pattern list
@@ -46,6 +47,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 from _bev_analyze import faq_visible_count as _faq_visible_count  # noqa: E402
+from _bev_analyze import visible_text as _visible_text  # noqa: E402
+from _bev_analyze import _norm_for_match  # noqa: E402
 # Hreflang detector that also walks Next.js streaming chunks (RSC payloads).
 # Prior to wiring this in, App Router sites with locales declared inside
 # self.__next_f.push(...) chunks reported zero hreflang in the audit output.
@@ -58,17 +61,56 @@ from deterministic_checks_extras import detect_hreflang as _detect_hreflang  # n
 
 USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (AuditBot)'
 
+# Fixed slug for the guaranteed-404 probe. A timestamped slug made the same
+# input produce different JSON on every run (and different probe URLs in
+# evidence), breaking reproducibility.
+NONEXISTENT_PROBE_SLUG = 'auditbot-nonexistent-probe-3f9c2a'
+
+
+def decode_body(raw, headers):
+    """Decode a response body. Prefer the Content-Type charset, then a
+    <meta charset> sniff, then UTF-8. Always errors='replace' so a bad
+    declaration can't crash the fetch."""
+    charset = None
+    if headers is not None:
+        try:
+            charset = headers.get_content_charset()
+        except AttributeError:
+            charset = None
+    if not charset:
+        m = re.search(
+            rb'<meta[^>]+charset=["\']?\s*([a-zA-Z0-9_\-]+)',
+            raw[:4096], re.IGNORECASE
+        )
+        if m:
+            charset = m.group(1).decode('ascii', errors='replace')
+    for cs in (charset, 'utf-8'):
+        if not cs:
+            continue
+        try:
+            return raw.decode(cs, errors='replace')
+        except (LookupError, ValueError):
+            continue
+    return raw.decode('utf-8', errors='replace')
+
 
 def fetch(url, timeout=15, allow_redirects=True, user_agent=USER_AGENT):
     """Fetch URL with controlled behavior. Returns (html, final_url, status, headers, redirect_chain)."""
     req = urllib.request.Request(url, headers={'User-Agent': user_agent})
     redirect_chain = []
     try:
-        # Build opener that records redirects
+        # Build opener that records redirects.
+        # http_error_308 alias: urllib only learned to follow 308 Permanent
+        # Redirect in Python 3.11; without this, every 308 (e.g. http→https
+        # on Vercel/Framer hosts) raises HTTPError and zero checks run.
         class RecordingHandler(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 redirect_chain.append({'from': req.full_url, 'to': newurl, 'status': code})
-                return super().redirect_request(req, fp, code, msg, headers, newurl)
+                # Base redirect_request has a hardcoded (301,302,303,307)
+                # allowlist on Python < 3.11 — present 308 as 307 to it.
+                return super().redirect_request(
+                    req, fp, 307 if code == 308 else code, msg, headers, newurl)
+            http_error_308 = urllib.request.HTTPRedirectHandler.http_error_307
 
         if allow_redirects:
             opener = urllib.request.build_opener(RecordingHandler())
@@ -77,19 +119,24 @@ def fetch(url, timeout=15, allow_redirects=True, user_agent=USER_AGENT):
             class NoFollowHandler(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, req, fp, code, msg, headers, newurl):
                     return None
+                http_error_308 = urllib.request.HTTPRedirectHandler.http_error_307
             opener = urllib.request.build_opener(NoFollowHandler())
 
         resp = opener.open(req, timeout=timeout)
-        html = resp.read().decode('utf-8', errors='replace')
+        html = decode_body(resp.read(), resp.headers)
         return html, resp.url, resp.status, dict(resp.headers), redirect_chain
     except HTTPError as e:
         try:
-            body = e.read().decode('utf-8', errors='replace')
+            body = decode_body(e.read(), e.headers)
         except Exception:
             body = ''
-        return body, url, e.code, dict(e.headers) if e.headers else {}, redirect_chain
-    except Exception as e:
-        return '', url, 0, {}, redirect_chain
+        # The error may have occurred after one or more redirects — report
+        # the last hop of the chain as final_url, not the original URL.
+        final_url = redirect_chain[-1]['to'] if redirect_chain else url
+        return body, final_url, e.code, dict(e.headers) if e.headers else {}, redirect_chain
+    except Exception:
+        final_url = redirect_chain[-1]['to'] if redirect_chain else url
+        return '', final_url, 0, {}, redirect_chain
 
 
 def strip_tags(html):
@@ -99,8 +146,33 @@ def strip_tags(html):
     c = re.sub(r'<style[^>]*>.*?</style>', ' ', c, flags=re.DOTALL | re.IGNORECASE)
     c = re.sub(r'<!--.*?-->', ' ', c, flags=re.DOTALL)
     t = re.sub(r'<[^>]+>', ' ', c)
-    t = re.sub(r'&[a-zA-Z#0-9]+;', ' ', t)
+    # Decode entities instead of deleting them: "AT&amp;T" must become
+    # "AT&T", not "AT T".
+    t = html_unescape(t)
     return re.sub(r'\s+', ' ', t).strip()
+
+
+def extract_jsonld_blocks(html):
+    """Return the raw inner text of every <script type="application/ld+json">
+    block. Single shared pattern for all JSON-LD consumers — D9 previously
+    used a stricter regex than the other checks and could disagree with them
+    on the same page."""
+    return [
+        m.group(1)
+        for m in re.finditer(
+            r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>',
+            html, re.IGNORECASE | re.DOTALL
+        )
+    ]
+
+
+def term_pattern(term):
+    """Whole-word regex for a term. Plain \\b never matches next to a
+    non-word character, so the boundary is only applied where the term's
+    edge is a word character (e.g. brands ending in '!' or '+')."""
+    prefix = r'\b' if re.match(r'\w', term) else ''
+    suffix = r'\b' if re.search(r'\w$', term) else ''
+    return prefix + re.escape(term) + suffix
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -122,11 +194,7 @@ def check_d9_faq_schema_match(html):
     # FAQPage schema count
     faq_schema_count = 0
     schema_questions = []
-    blocks = re.findall(
-        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.IGNORECASE | re.DOTALL
-    )
-    for b in blocks:
+    for b in extract_jsonld_blocks(html):
         try:
             data = json.loads(b.strip())
         except json.JSONDecodeError:
@@ -139,11 +207,22 @@ def check_d9_faq_schema_match(html):
             if isinstance(item.get('@graph'), list):
                 candidates.extend(item['@graph'])
             for c in candidates:
-                if isinstance(c, dict) and c.get('@type') == 'FAQPage':
-                    me = c.get('mainEntity', [])
-                    if isinstance(me, list):
-                        faq_schema_count = len(me)
-                        schema_questions = [q.get('name', '') for q in me if isinstance(q, dict)]
+                if not isinstance(c, dict):
+                    continue
+                # '@type' may be a string or a list of types
+                types = c.get('@type')
+                types = types if isinstance(types, list) else [types]
+                if 'FAQPage' not in types:
+                    continue
+                # mainEntity may be a single dict instead of a list
+                me = c.get('mainEntity', [])
+                if isinstance(me, dict):
+                    me = [me]
+                if isinstance(me, list):
+                    # Accumulate across multiple FAQPage blocks instead of
+                    # letting the last block overwrite earlier counts.
+                    faq_schema_count += len(me)
+                    schema_questions.extend(q.get('name', '') for q in me if isinstance(q, dict))
 
     # Determine status
     if visible_count == 0 and faq_schema_count == 0:
@@ -169,6 +248,49 @@ def check_d9_faq_schema_match(html):
             }
         }
 
+    # Ground-truth fallback before declaring a mismatch: widget-pattern
+    # detection misses builders (Framer, custom markup) whose FAQ text is
+    # plainly visible. Google's policy tests whether the marked-up text is
+    # displayed — so check the schema questions against the visible text.
+    questions_visible = 0
+    if faq_schema_count > visible_count and schema_questions:
+        vis_norm = _norm_for_match(_visible_text(html, max_chars=300_000))
+        questions_visible = sum(
+            1 for q in schema_questions
+            if isinstance(q, str) and _norm_for_match(q)
+            and _norm_for_match(q) in vis_norm
+        )
+
+    if faq_schema_count > 0 and questions_visible >= faq_schema_count:
+        return {
+            'status': 'pass',
+            'evidence': (
+                f'All {faq_schema_count} FAQPage schema questions found in visible '
+                f'HTML text (no FAQ widget pattern matched — text-match fallback).'),
+            'detail': {
+                'visible_count': visible_count,
+                'schema_count': faq_schema_count,
+                'schema_questions_visible': questions_visible,
+                'detection_method': 'schema_question_text_match',
+                'schema_questions': schema_questions,
+            }
+        }
+
+    if faq_schema_count > 0 and questions_visible >= (faq_schema_count + 1) // 2:
+        return {
+            'status': 'warn',
+            'evidence': (
+                f'{questions_visible} of {faq_schema_count} FAQPage schema questions '
+                f'found in visible HTML text; the rest are in schema only.'),
+            'detail': {
+                'visible_count': visible_count,
+                'schema_count': faq_schema_count,
+                'schema_questions_visible': questions_visible,
+                'detection_method': 'schema_question_text_match',
+                'schema_questions': schema_questions,
+            }
+        }
+
     # Mismatch
     direction = 'schema has more than visible' if faq_schema_count > visible_count else 'visible has more than schema'
     return {
@@ -177,6 +299,7 @@ def check_d9_faq_schema_match(html):
         'detail': {
             'visible_count': visible_count,
             'schema_count': faq_schema_count,
+            'schema_questions_visible': questions_visible,
             'detection_method': detection_method,
             'mismatch_direction': direction,
             'schema_questions': schema_questions,
@@ -202,7 +325,16 @@ def check_a7b_h1_nesting(html):
             html, re.IGNORECASE | re.DOTALL
         ):
             inner = m.group(1)
-            if re.search(r'<h1[^>]*>', inner, re.IGNORECASE):
+            h1_open = re.search(r'<h1[^>]*>', inner, re.IGNORECASE)
+            if h1_open:
+                # HTML auto-close semantics: a heading start tag implicitly
+                # closes any open heading. If another heading starts between
+                # the parent's open tag and the <h1>, the parent was already
+                # closed (unclosed <hN> spanning to a later </hN>) and the H1
+                # is not actually nested — don't flag it.
+                before_h1 = inner[:h1_open.start()]
+                if re.search(r'<h[1-6][\s>/]', before_h1, re.IGNORECASE):
+                    continue
                 # Extract the H1 content for evidence
                 h1_match = re.search(r'<h1[^>]*>(.*?)</h1>', inner, re.IGNORECASE | re.DOTALL)
                 h1_text = ''
@@ -247,19 +379,18 @@ def check_j2_brand_name_consistency(html, brand_name=None):
     if brand_name:
         candidates.add(brand_name)
     else:
-        for m in re.finditer(
-            r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>',
-            html, re.IGNORECASE | re.DOTALL
-        ):
+        for b in extract_jsonld_blocks(html):
             try:
-                data = json.loads(m.group(1).strip())
+                data = json.loads(b.strip())
             except json.JSONDecodeError:
                 continue
             items = data if isinstance(data, list) else [data]
             for item in items:
                 if isinstance(item, dict) and item.get('@type') in ('Organization', 'MedicalBusiness', 'LocalBusiness', 'SoftwareApplication'):
                     n = item.get('name')
-                    if n and len(n) >= 4:
+                    # name can be a non-string JSON-LD value like
+                    # {"@value": "Acme"} — only strings are usable here
+                    if isinstance(n, str) and len(n) >= 4:
                         candidates.add(n)
 
     # Also look for common product/drug names that get obfuscated in this industry
@@ -269,18 +400,25 @@ def check_j2_brand_name_consistency(html, brand_name=None):
     # Substitution map (lowercase)
     subst_map = {'o': '0', 'l': '1', 'i': '1', 'e': '3', 'a': '4', 's': '5', 'b': '6', 'z': '2'}
 
+    # Scan tag-stripped visible text, not raw HTML — minified JS, nonces and
+    # asset hashes produce accidental hits that are not real page content.
+    visible_text = strip_tags(html)
+
     mixed_variants = []
-    for term in list(candidates) + known_terms:
+    # sorted() so set iteration order can't reorder the output between runs
+    for term in sorted(candidates) + known_terms:
         if not term or len(term) < 4:
             continue
         # Real count
-        real_count = len(re.findall(r'\b' + re.escape(term) + r'\b', html, re.IGNORECASE))
+        real_count = len(re.findall(term_pattern(term), visible_text, re.IGNORECASE))
         # Generate substituted variants and count them
         for idx, ch in enumerate(term.lower()):
             if ch in subst_map:
                 substituted = term[:idx] + subst_map[ch] + term[idx+1:]
-                sub_count = len(re.findall(r'\b' + re.escape(substituted) + r'\b', html, re.IGNORECASE))
-                if sub_count > 0:
+                sub_count = len(re.findall(term_pattern(substituted), visible_text, re.IGNORECASE))
+                # Require corroboration before failing: a single substituted
+                # hit with the real spelling absent is more likely noise.
+                if sub_count >= 2 or (sub_count > 0 and real_count > 0):
                     mixed_variants.append({
                         'real': term,
                         'real_count': real_count,
@@ -315,28 +453,50 @@ def check_a4b_canonical_redirect_chain(html, current_url):
 
     Flags the Valeo-style case: page at /foo, canonical says /foo/, which 308s to /foo.
     """
-    # Extract canonical
-    m = re.search(
-        r'<link[^>]*rel=["\']canonical["\'][^>]*href=["\']([^"\']*)',
-        html, re.IGNORECASE
-    )
-    if not m:
+    # Extract canonical: walk <link> tags and read rel/href attributes
+    # order- and quote-agnostically (rel after href, single/double/no quotes)
+    attr_pat = r'''(?<![\w-]){name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))'''
+    canonical = None
+    for tag in re.finditer(r'<link\b[^>]*>', html, re.IGNORECASE):
+        tag_html = tag.group(0)
+        rel_m = re.search(attr_pat.format(name='rel'), tag_html, re.IGNORECASE)
+        href_m = re.search(attr_pat.format(name='href'), tag_html, re.IGNORECASE)
+        if not rel_m or not href_m:
+            continue
+        rel_val = next(g for g in rel_m.groups() if g is not None)
+        if 'canonical' not in rel_val.lower().split():
+            continue
+        canonical = html_unescape(next(g for g in href_m.groups() if g is not None).strip())
+        break
+
+    if canonical is None:
         return {
             'status': 'warn',
             'evidence': 'No canonical tag found on the page.',
             'detail': {}
         }
+    if not canonical:
+        return {
+            'status': 'warn',
+            'evidence': 'Canonical tag present but its href is empty.',
+            'detail': {'canonical_url': '', 'current_url': current_url}
+        }
 
-    canonical = m.group(1)
+    # Resolve relative canonicals (e.g. '/pricing') against the served URL,
+    # then drop the fragment. This is the URL we probe.
+    canonical_resolved = urllib.parse.urldefrag(
+        urllib.parse.urljoin(current_url, canonical)
+    )[0]
 
-    # Normalize URLs for comparison (strip query + fragment but keep path/slash)
+    # Normalize for comparison: resolve against the served URL, strip the
+    # fragment, lowercase scheme + host. The query string is KEPT — a
+    # canonical that differs only by query points at a different URL.
     def normalize(u):
-        # Add scheme if missing
-        if u.startswith('//'):
-            u = 'https:' + u
-        elif not u.startswith('http'):
-            u = 'https://' + u.lstrip('/')
-        return u
+        resolved = urllib.parse.urljoin(current_url, u)
+        parts = urllib.parse.urlsplit(resolved)
+        return urllib.parse.urlunsplit(
+            (parts.scheme.lower(), parts.netloc.lower(), parts.path, parts.query, '')
+        )
 
     canonical_norm = normalize(canonical)
     current_norm = normalize(current_url)
@@ -355,10 +515,10 @@ def check_a4b_canonical_redirect_chain(html, current_url):
 
     # Case 2: Canonical differs. Probe the canonical URL to see if it 3xx's.
     # Test without following redirects
-    _, _, status, headers, redirects = fetch(canonical_norm, allow_redirects=False, timeout=10)
+    _, _, status, headers, redirects = fetch(canonical_resolved, allow_redirects=False, timeout=10)
 
     # Also test with redirects to get final URL
-    _, final_url, final_status, _, full_chain = fetch(canonical_norm, allow_redirects=True, timeout=10)
+    _, final_url, final_status, _, full_chain = fetch(canonical_resolved, allow_redirects=True, timeout=10)
 
     is_redirect = status in (301, 302, 303, 307, 308)
     redirect_target = headers.get('Location') or headers.get('location') if is_redirect else None
@@ -413,36 +573,43 @@ def check_b1_ttfb_median(url, samples=5):
     Fixes the single-sample variance problem I hit on Valeo weight loss.
     """
     ttfbs = []
-    origin_times = []
+    discarded_non_2xx = 0
     for i in range(samples):
         try:
-            # Use curl for accurate TTFB measurement
+            # Use curl for accurate TTFB measurement. No cache-busting query
+            # param — the 'Cache-Control: no-cache' header asks for
+            # revalidation while still measuring the CDN-cached reality users
+            # hit. '-L' follows redirects so a fast 301 doesn't fake the TTFB.
             result = subprocess.run(
-                ['curl', '-sS', '-o', '/dev/null', '-w',
-                 '%{time_starttransfer} %{header_x-envoy-upstream-service-time}',
+                ['curl', '-sS', '-L', '-o', '/dev/null', '-w',
+                 '%{time_starttransfer} %{http_code}',
                  '--max-time', '15',
                  '-H', 'Cache-Control: no-cache',
-                 f'{url}?_ttfb_sample={i}'],
+                 url],
                 capture_output=True, text=True, timeout=20
             )
             parts = result.stdout.strip().split()
-            if parts:
+            if len(parts) >= 2:
                 ttfb_sec = float(parts[0])
-                ttfbs.append(ttfb_sec * 1000)  # convert to ms
-                if len(parts) > 1 and parts[1]:
-                    try:
-                        origin_times.append(float(parts[1]))
-                    except ValueError:
-                        pass
+                http_code = int(parts[1])
+                if 200 <= http_code < 300:
+                    ttfbs.append(ttfb_sec * 1000)  # convert to ms
+                else:
+                    # Error/challenge responses don't measure the real page
+                    discarded_non_2xx += 1
             time.sleep(0.5)
         except Exception:
             continue
 
     if not ttfbs:
+        evidence = 'Could not collect TTFB samples (network or tool failure).'
+        if discarded_non_2xx:
+            evidence = (f'Could not collect TTFB samples: all {discarded_non_2xx} '
+                        f'responses were non-2xx.')
         return {
             'status': 'na',
-            'evidence': 'Could not collect TTFB samples (network or tool failure).',
-            'detail': {}
+            'evidence': evidence,
+            'detail': {'discarded_non_2xx': discarded_non_2xx}
         }
 
     ttfbs.sort()
@@ -462,18 +629,26 @@ def check_b1_ttfb_median(url, samples=5):
         status = 'fail'
         verdict = 'Poor (>1800ms)'
 
+    evidence = f'TTFB median: {median_ttfb:.0f}ms ({verdict}). Samples: {[int(t) for t in ttfbs]}'
+    if discarded_non_2xx:
+        evidence += f' ({discarded_non_2xx} non-2xx sample(s) discarded)'
+
     return {
         'status': status,
-        'evidence': f'TTFB median: {median_ttfb:.0f}ms ({verdict}). Samples: {[int(t) for t in ttfbs]}',
+        'evidence': evidence,
         'detail': {
             'samples_ms': [round(t, 0) for t in ttfbs],
             'median_ms': round(median_ttfb, 0),
             'p95_ms': round(p95_ttfb, 0),
             'min_ms': round(min_ttfb, 0),
             'max_ms': round(max_ttfb, 0),
-            'origin_times_ms': origin_times,
+            # Kept empty for output-shape compatibility: the curl write-out
+            # that fed this ('%{header_x-envoy-...}') was never a valid
+            # variable, so the field was always-empty noise.
+            'origin_times_ms': [],
             'verdict': verdict,
             'sample_count': len(ttfbs),
+            'discarded_non_2xx': discarded_non_2xx,
         }
     }
 
@@ -488,12 +663,9 @@ def check_d4_schema_id_coverage(html):
     Flags the TRYPS/AnswerMonk pattern of entities without @id.
     """
     entities = []
-    for m in re.finditer(
-        r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>',
-        html, re.IGNORECASE | re.DOTALL
-    ):
+    for b in extract_jsonld_blocks(html):
         try:
-            data = json.loads(m.group(1).strip())
+            data = json.loads(b.strip())
         except json.JSONDecodeError:
             continue
 
@@ -564,12 +736,9 @@ def check_c12b_datemodified_staleness(html):
     import datetime
 
     dates_found = []
-    for m in re.finditer(
-        r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>',
-        html, re.IGNORECASE | re.DOTALL
-    ):
+    for b in extract_jsonld_blocks(html):
         try:
-            data = json.loads(m.group(1).strip())
+            data = json.loads(b.strip())
         except json.JSONDecodeError:
             continue
         items = data if isinstance(data, list) else [data]
@@ -615,8 +784,11 @@ def check_c12b_datemodified_staleness(html):
             age_seconds = age.total_seconds()
             age_days = age_seconds / 86400
 
-            # Detect cosmetic pattern: dateModified within 60s of fetch time
-            if 0 <= age_seconds < 60:
+            # Detect cosmetic pattern: dateModified within 60s of fetch time.
+            # Date-only stamps (no time component) parse to midnight UTC and
+            # are not a Date.now() pattern — exempt them from this window.
+            date_only = bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', dm_str.strip()))
+            if 0 <= age_seconds < 60 and not date_only:
                 analyses.append({**d, 'analysis': 'cosmetic_near_now', 'age_days': round(age_days, 3)})
             elif age_seconds < 0:
                 analyses.append({**d, 'analysis': 'future_date', 'age_days': round(age_days, 3)})
@@ -630,10 +802,13 @@ def check_c12b_datemodified_staleness(html):
     # Determine overall status
     # If any date is cosmetic (== now), fail
     # If all dates are stale (>13 weeks), warn
-    # Otherwise pass
+    # Pass only when at least one date is genuinely fresh
+    # Unparseable-only or future-only sets warn with accurate evidence
     cosmetic = [a for a in analyses if a['analysis'] == 'cosmetic_near_now']
     stale = [a for a in analyses if a['analysis'] == 'stale_over_13_weeks']
     fresh = [a for a in analyses if a['analysis'] == 'fresh']
+    future = [a for a in analyses if a['analysis'] == 'future_date']
+    unparseable = [a for a in analyses if a['analysis'] == 'unparseable']
 
     if cosmetic:
         return {
@@ -650,9 +825,23 @@ def check_c12b_datemodified_staleness(html):
             'detail': {'analyses': analyses}
         }
 
+    if fresh:
+        return {
+            'status': 'pass',
+            'evidence': f'{len(fresh)} dateModified field(s) are fresh (<13 weeks old).',
+            'detail': {'analyses': analyses}
+        }
+
+    # No fresh, stale or cosmetic dates left — only future and/or
+    # unparseable values. Don't let these fall through to a pass.
+    parts = []
+    if future:
+        parts.append(f'{len(future)} in the future ({[a["dateModified"] for a in future]})')
+    if unparseable:
+        parts.append(f'{len(unparseable)} unparseable ({[a["dateModified"] for a in unparseable]})')
     return {
-        'status': 'pass',
-        'evidence': f'{len(fresh)} dateModified field(s) are fresh (<13 weeks old).',
+        'status': 'warn',
+        'evidence': 'No valid past dateModified found: ' + '; '.join(parts) + '.',
         'detail': {'analyses': analyses}
     }
 
@@ -664,34 +853,46 @@ def check_c12b_datemodified_staleness(html):
 def check_a2b_title_uniqueness(url, sample_size=3):
     """
     Fetch the page + a 404 URL + another sitemap URL. Compare titles.
-    If all 3 have the same title, site has a global placeholder title (SPA pattern).
+    Statuses are captured so WAF/challenge/error bodies don't masquerade as
+    page titles: the SPA-shell claim is only made when the main URL is 2xx,
+    and a 200 on the 404-probe is reported as a soft-404.
     """
     origin = re.match(r'(https?://[^/]+)', url).group(1) if re.match(r'(https?://[^/]+)', url) else None
     if not origin:
         return {'status': 'na', 'evidence': 'Could not parse origin from URL.', 'detail': {}}
 
     # Fetch current page
-    html1, _, _, _, _ = fetch(url)
+    html1, _, status1, _, _ = fetch(url)
     title1 = extract_title_from_html(html1)
 
-    # Fetch a guaranteed-404 URL
-    ne_url = f'{origin}/nonexistent-probe-{int(time.time())}'
-    html2, _, _, _, _ = fetch(ne_url)
+    if not (200 <= status1 < 300):
+        return {
+            'status': 'na',
+            'evidence': f'Main URL returned HTTP {status1} — title uniqueness not assessable on an error/challenge response.',
+            'detail': {'titles': {url: title1}, 'statuses': {url: status1}}
+        }
+
+    # Fetch a guaranteed-404 URL (fixed probe slug keeps output reproducible)
+    ne_url = f'{origin}/{NONEXISTENT_PROBE_SLUG}'
+    html2, _, status2, _, _ = fetch(ne_url)
     title2 = extract_title_from_html(html2)
+    probe_2xx = 200 <= status2 < 300
 
     # Try to fetch another URL from sitemap.xml
     sitemap_url = f'{origin}/sitemap.xml'
     sitemap_html, _, sitemap_status, _, _ = fetch(sitemap_url)
     other_title = None
     other_url = None
+    other_status = None
     if sitemap_status == 200 and sitemap_html:
         # Pick a URL that's different from the current one
         locs = re.findall(r'<loc>([^<]+)</loc>', sitemap_html)
         for loc in locs:
             if loc != url and not loc.endswith('/sitemap.xml'):
                 other_url = loc
-                html3, _, _, _, _ = fetch(loc)
-                other_title = extract_title_from_html(html3)
+                html3, _, other_status, _, _ = fetch(loc)
+                if 200 <= other_status < 300:
+                    other_title = extract_title_from_html(html3)
                 break
 
     # Compare
@@ -699,6 +900,9 @@ def check_a2b_title_uniqueness(url, sample_size=3):
         url: title1,
         ne_url: title2,
     }
+    statuses = {url: status1, ne_url: status2}
+    if other_url is not None:
+        statuses[other_url] = other_status
     if other_url and other_title:
         titles_collected[other_url] = other_title
 
@@ -707,29 +911,43 @@ def check_a2b_title_uniqueness(url, sample_size=3):
         return {
             'status': 'na',
             'evidence': 'Could not collect enough titles to compare.',
-            'detail': {'titles': titles_collected}
+            'detail': {'titles': titles_collected, 'statuses': statuses}
         }
 
-    # If 2+ URLs return the same title → SPA placeholder pattern
-    if len(unique_titles) == 1:
+    # If every tested URL returns the same title → shared shell pattern
+    if len(unique_titles) == 1 and all(titles_collected.values()):
+        shared = list(unique_titles)[0]
+        if probe_2xx:
+            # Main URL is 2xx (checked above), so the SPA-shell claim is safe
+            return {
+                'status': 'fail',
+                'evidence': f'All {len(titles_collected)} tested URLs return the same title "{shared}", and the nonexistent-URL probe returned HTTP {status2} (soft-404). This indicates a client-side SPA shell without per-page SSR.',
+                'detail': {'titles': titles_collected, 'statuses': statuses, 'unique_count': 1, 'soft_404': True}
+            }
         return {
             'status': 'fail',
-            'evidence': f'All {len(titles_collected)} tested URLs return the same title: "{list(unique_titles)[0]}". This indicates a client-side SPA without per-page SSR.',
-            'detail': {'titles': titles_collected, 'unique_count': 1}
+            'evidence': f'All {len(titles_collected)} tested URLs return the same title "{shared}" (404 probe correctly returned HTTP {status2}). Pages share a global placeholder title.',
+            'detail': {'titles': titles_collected, 'statuses': statuses, 'unique_count': 1, 'soft_404': False}
         }
 
-    # If the 404 title matches the real page title → still a red flag
+    # If the 404-probe title matches the real page title → still a red flag
     if title2 and title1 and title2 == title1:
+        if probe_2xx:
+            return {
+                'status': 'fail',
+                'evidence': f'Nonexistent URL returned HTTP {status2} with the same title "{title1}" as the real page — a soft-404. Nonexistent URLs should return 404.',
+                'detail': {'titles': titles_collected, 'statuses': statuses, 'unique_count': len(unique_titles), 'soft_404': True}
+            }
         return {
             'status': 'fail',
-            'evidence': f'404 URL and real URL return same title "{title1}". Indicates SPA shell without per-URL rendering.',
-            'detail': {'titles': titles_collected, 'unique_count': len(unique_titles)}
+            'evidence': f'404 page reuses the real page title "{title1}" (probe returned HTTP {status2}). Title appears to be a global template value.',
+            'detail': {'titles': titles_collected, 'statuses': statuses, 'unique_count': len(unique_titles), 'soft_404': False}
         }
 
     return {
         'status': 'pass',
         'evidence': f'{len(titles_collected)} URLs tested, {len(unique_titles)} unique titles. Per-page titles appear to be rendered.',
-        'detail': {'titles': titles_collected, 'unique_count': len(unique_titles)}
+        'detail': {'titles': titles_collected, 'statuses': statuses, 'unique_count': len(unique_titles)}
     }
 
 
@@ -749,13 +967,17 @@ def check_d12_person_schema(html):
     Check if any Person schema exists with credentials.
     For YMYL pages (medical, financial), this is a required E-E-A-T signal.
     """
+    def node_types(node):
+        # '@type' may be a string or a list of types
+        t = node.get('@type')
+        if isinstance(t, list):
+            return [x for x in t if isinstance(x, str)]
+        return [t] if isinstance(t, str) else []
+
     persons = []
-    for m in re.finditer(
-        r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>',
-        html, re.IGNORECASE | re.DOTALL
-    ):
+    for b in extract_jsonld_blocks(html):
         try:
-            data = json.loads(m.group(1).strip())
+            data = json.loads(b.strip())
         except json.JSONDecodeError:
             continue
         items = data if isinstance(data, list) else [data]
@@ -765,24 +987,27 @@ def check_d12_person_schema(html):
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if item.get('@type') == 'Person':
+            if 'Person' in node_types(item):
                 persons.append({
                     'name': item.get('name'),
                     'jobTitle': item.get('jobTitle'),
                     'hasCredential': bool(item.get('hasCredential')),
                     'sameAs_count': len(item.get('sameAs', [])) if isinstance(item.get('sameAs'), list) else 0,
                 })
-            # Nested as founder
+            # Nested as founder/author — value may be a single Person dict
+            # or a LIST of Person dicts; normalize to a list
             for field in ['founder', 'author', 'medicalSpecialist']:
                 nested = item.get(field)
-                if isinstance(nested, dict) and nested.get('@type') == 'Person':
-                    persons.append({
-                        'name': nested.get('name'),
-                        'jobTitle': nested.get('jobTitle'),
-                        'hasCredential': bool(nested.get('hasCredential')),
-                        'sameAs_count': len(nested.get('sameAs', [])) if isinstance(nested.get('sameAs'), list) else 0,
-                        'found_via': field,
-                    })
+                nested_list = nested if isinstance(nested, list) else [nested]
+                for n in nested_list:
+                    if isinstance(n, dict) and 'Person' in node_types(n):
+                        persons.append({
+                            'name': n.get('name'),
+                            'jobTitle': n.get('jobTitle'),
+                            'hasCredential': bool(n.get('hasCredential')),
+                            'sameAs_count': len(n.get('sameAs', [])) if isinstance(n.get('sameAs'), list) else 0,
+                            'found_via': field,
+                        })
 
     if not persons:
         return {
@@ -839,7 +1064,7 @@ def check_d14_hreflang_coverage(html):
 # ──────────────────────────────────────────────────────────────────────────
 
 def run_all_checks(url):
-    """Run all 8 deterministic checks and return consolidated JSON."""
+    """Run all deterministic checks and return consolidated JSON."""
     # Fetch the page once
     html, final_url, status_code, _, _ = fetch(url)
 
@@ -847,6 +1072,7 @@ def run_all_checks(url):
         return {
             'url': url,
             'error': 'Could not fetch page',
+            'http_status': status_code,
             'checks': {}
         }
 
@@ -857,19 +1083,45 @@ def run_all_checks(url):
         'checks': {}
     }
 
-    # Run checks that only need HTML
-    results['checks']['D9_faqpage_schema_vs_visible_match'] = check_d9_faq_schema_match(html)
-    results['checks']['A7b_h1_nested_in_heading'] = check_a7b_h1_nesting(html)
-    results['checks']['J2_brand_name_consistency'] = check_j2_brand_name_consistency(html)
-    results['checks']['D4_schema_id_coverage'] = check_d4_schema_id_coverage(html)
-    results['checks']['C12b_datemodified_staleness'] = check_c12b_datemodified_staleness(html)
-    results['checks']['D12_person_schema_with_credentials'] = check_d12_person_schema(html)
-    results['checks']['D14_hreflang_coverage'] = check_d14_hreflang_coverage(html)
+    # (check_id, function, args) — HTML-only checks first, then network checks
+    checks_to_run = [
+        ('D9_faqpage_schema_vs_visible_match', check_d9_faq_schema_match, (html,)),
+        ('A7b_h1_nested_in_heading', check_a7b_h1_nesting, (html,)),
+        ('J2_brand_name_consistency', check_j2_brand_name_consistency, (html,)),
+        ('D4_schema_id_coverage', check_d4_schema_id_coverage, (html,)),
+        ('C12b_datemodified_staleness', check_c12b_datemodified_staleness, (html,)),
+        ('D12_person_schema_with_credentials', check_d12_person_schema, (html,)),
+        ('D14_hreflang_coverage', check_d14_hreflang_coverage, (html,)),
+        ('A4b_canonical_redirect_chain', check_a4b_canonical_redirect_chain, (html, final_url)),
+        ('B1_ttfb_median_5_samples', check_b1_ttfb_median, (url,)),
+        ('A2b_title_uniqueness_sample', check_a2b_title_uniqueness, (url,)),
+    ]
 
-    # Run checks that need network
-    results['checks']['A4b_canonical_redirect_chain'] = check_a4b_canonical_redirect_chain(html, final_url)
-    results['checks']['B1_ttfb_median_5_samples'] = check_b1_ttfb_median(url)
-    results['checks']['A2b_title_uniqueness_sample'] = check_a2b_title_uniqueness(url)
+    # Error/challenge bodies (403/404/500, WAF interstitials) are not the
+    # page — running content checks on them produces false claims in
+    # reports. fetch() follows redirects, so a final 3xx also means real
+    # content was never reached; treat it the same way.
+    if status_code == 0 or status_code >= 300:
+        results['content_checks_skipped'] = True
+        evidence = f'page returned HTTP {status_code} — content checks not applicable'
+        for check_id, _fn, _args in checks_to_run:
+            results['checks'][check_id] = {
+                'status': 'na',
+                'evidence': evidence,
+                'detail': {'http_status': status_code},
+            }
+    else:
+        for check_id, fn, args in checks_to_run:
+            try:
+                results['checks'][check_id] = fn(*args)
+            except Exception as e:
+                # Exception isolation: one crashing check must not kill
+                # the whole run.
+                results['checks'][check_id] = {
+                    'status': 'na',
+                    'evidence': f'check crashed: {type(e).__name__}: {e}',
+                    'detail': {},
+                }
 
     # Summary counts
     statuses = [c['status'] for c in results['checks'].values()]

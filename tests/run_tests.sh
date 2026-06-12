@@ -321,6 +321,80 @@ for name in ('bev', 'det', 'robots', 'sitemap', 'schema'):
 fi
 
 # ----------------------------------------------------------------------
+# TEST 9: Transport-aware classification (skill-unified analyzer)
+# ----------------------------------------------------------------------
+# Regression for the somana.com false positive (2026-06): probes that end
+# on a 3xx/4xx/0 must NOT be classified by word count — an empty 308 body
+# previously read as "JS-only SPA with 0 visible words".
+echo ""
+echo "[9] transport gate — 3xx/4xx/0 must not classify as content"
+UNI_DIR="${SCRIPT_DIR}/../skill-unified/scripts"
+OUT=$(PYTHONPATH="${UNI_DIR}" python3 -c "
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('bev', '${UNI_DIR}/_bev_analyze.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print('R308=' + m.classify_ssr(0, False, [], http_code=308))
+print('R403=' + m.classify_ssr(0, False, [], http_code=403))
+print('R500=' + m.classify_ssr(0, False, [], http_code=500))
+print('R0='   + m.classify_ssr(0, False, [], http_code=0))
+print('R200=' + m.classify_ssr(890, False, [], http_code=200))
+# back-compat: no http_code arg keeps old behavior
+print('LEGACY=' + m.classify_ssr(8, True, ['angular_app_root']))
+" 2>&1)
+assert_contains "308 → unresolved_redirect"  "$OUT" "R308=unresolved_redirect"
+assert_contains "403 → bot_blocked"          "$OUT" "R403=bot_blocked"
+assert_contains "500 → http_error"           "$OUT" "R500=http_error"
+assert_contains "0 → fetch_failed"           "$OUT" "R0=fetch_failed"
+assert_contains "200 + 890 words → fully_accessible" "$OUT" "R200=fully_accessible"
+assert_contains "no-http_code call keeps legacy spa_no_ssr" "$OUT" "LEGACY=spa_no_ssr"
+
+# ----------------------------------------------------------------------
+# TEST 10: curl -w parsing — 5-field (with redirects) and legacy 3-field
+# ----------------------------------------------------------------------
+echo ""
+echo "[10] parse_curl_result — new and legacy formats"
+OUT=$(python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('bev', '${UNI_DIR}/_bev_analyze.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+new = m.parse_curl_result('200 789591 0.041 1 https://somana.com/')
+old = m.parse_curl_result('200 789591 0.041')
+fail = m.parse_curl_result('000 0 0 0 -')
+print('NEW_CODE=' + str(new['http_code']), 'NEW_RED=' + str(new['num_redirects']), 'NEW_URL=' + new['final_url'])
+print('OLD_CODE=' + str(old['http_code']), 'OLD_URL=[' + old['final_url'] + ']')
+print('FAIL_CODE=' + str(fail['http_code']), 'FAIL_URL=[' + fail['final_url'] + ']')
+" 2>&1)
+assert_contains "5-field parses redirects + final URL" "$OUT" "NEW_RED=1 NEW_URL=https://somana.com/"
+assert_contains "legacy 3-field still parses"          "$OUT" "OLD_CODE=200 OLD_URL=[]"
+assert_contains "failure sentinel parses to code 0"    "$OUT" "FAIL_CODE=0 FAIL_URL=[]"
+
+# ----------------------------------------------------------------------
+# TEST 11: FAQ schema parsing — @type arrays, dict mainEntity, text match
+# ----------------------------------------------------------------------
+echo ""
+echo "[11] FAQ schema — type arrays, single-dict mainEntity, ground-truth text match"
+OUT=$(python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('bev', '${UNI_DIR}/_bev_analyze.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+h1 = '<script type=\"application/ld+json\">{\"@type\": [\"FAQPage\", \"WebPage\"], \"mainEntity\": [{\"@type\": \"Question\", \"name\": \"How much does it cost?\"}, {\"@type\": \"Question\", \"name\": \"Is it insured?\"}]}</script>'
+h2 = '<script type=\"application/ld+json\">{\"@type\": \"FAQPage\", \"mainEntity\": {\"@type\": \"Question\", \"name\": \"Single question?\"}}</script>'
+print('ARR=' + str(m.faq_schema_count(h1)))
+print('DICT=' + str(m.faq_schema_count(h2)))
+qs = m.faq_schema_questions(h1)
+body = '<body><div><span>How much does it cost?</span></div></body>' + h1
+vis = m.visible_text(body)
+vn = m._norm_for_match(vis)
+hits = sum(1 for q in qs if m._norm_for_match(q) in vn)
+print('QS=' + str(len(qs)), 'HITS=' + str(hits))
+print('DE=' + str(m.looks_like_question('Wie funktioniert die Abrechnung')))
+" 2>&1)
+assert_contains "@type array FAQPage counts 2"      "$OUT" "ARR=2"
+assert_contains "single-dict mainEntity counts 1"   "$OUT" "DICT=1"
+assert_contains "schema questions extracted + matched in visible text" "$OUT" "QS=2 HITS=1"
+assert_contains "German question word detected"     "$OUT" "DE=True"
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 echo ""

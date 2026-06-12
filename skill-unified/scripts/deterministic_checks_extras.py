@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-deterministic_checks_v2.py — Additive v2 helpers for deterministic_checks.py.
+deterministic_checks_extras.py — Additive helpers for deterministic_checks.py.
 
 This module does NOT replace the original deterministic_checks.py (which
 contains 9 established checks that are independently verified).
@@ -10,7 +10,7 @@ a simple import:
 
     # In the original deterministic_checks.py, add near the top:
     try:
-        from deterministic_checks_v2 import detect_hreflang, looks_like_question
+        from deterministic_checks_extras import detect_hreflang, looks_like_question
     except ImportError:
         pass
 
@@ -23,7 +23,7 @@ Currently provides:
    sites that stream metadata via RSC chunks.
 
 2. looks_like_question(text)
-   Re-export from bev_analyze_v2 for easy reuse.
+   Re-export from _bev_analyze for easy reuse.
 
 3. safe_url_for_shell(url)
    Escapes a URL safely for use in contexts where it might be passed
@@ -41,7 +41,7 @@ from typing import Dict, Set
 try:
     from _bev_analyze import looks_like_question  # noqa: F401
 except ImportError:
-    # Minimal fallback if bev_analyze_v2 isn't on the path
+    # Minimal fallback if _bev_analyze isn't on the path
     def looks_like_question(text: str) -> bool:
         t = (text or '').strip().lower()
         if '?' in t:
@@ -66,15 +66,15 @@ def detect_hreflang(html: str) -> Dict:
           'toplevel_count': int,
           'streamed_count': int,
           'locales': [sorted list],
-          'status': 'pass' | 'warn' | 'fail',
+          'status': 'pass' | 'warn' | 'fail' | 'na',
           'evidence': str,
         }
     """
     if not html:
         return {
             'total_count': 0, 'toplevel_count': 0, 'streamed_count': 0,
-            'locales': [], 'status': 'fail',
-            'evidence': 'Empty HTML input.'
+            'locales': [], 'status': 'na',
+            'evidence': 'Empty HTML input — hreflang not assessable.'
         }
 
     # Top-level: <link rel="alternate" hreflang="en-AE" href="...">
@@ -92,21 +92,19 @@ def detect_hreflang(html: str) -> Dict:
     ):
         toplevel_langs.add(m.group(1).lower())
 
-    # Streaming: inside self.__next_f.push([1, "..."]) chunks,
-    # hreflang appears as "hrefLang":"en-AE" or escaped \"hrefLang\":\"en-AE\"
+    # Streaming: Next.js RSC payloads carry hreflang as a JSON key, e.g.
+    # "hrefLang":"en-AE" or escaped \"hrefLang\":\"en-AE\". Scan the WHOLE
+    # document case-insensitively — extracting self.__next_f.push(...)
+    # chunks first truncated each chunk at its first ')' and missed
+    # lowercase "hreflang" keys. The JSON quoted-key syntax cannot appear
+    # inside a <link> tag (attributes are hreflang="..."), so the streamed
+    # count stays distinct from the top-level count.
     streamed_langs: Set[str] = set()
-    # Find any hrefLang/hreflang inside a self.__next_f.push call
-    push_chunks = re.findall(
-        r'self\.__next_f\.push\((.*?)\)',
-        html, re.IGNORECASE | re.DOTALL
-    )
-    for chunk in push_chunks:
-        # Un-escape \" that Next uses in streamed chunks
-        for m in re.finditer(
-            r'\\*"hrefLang\\*"\s*:\s*\\*"([a-zA-Z\-]+)\\*"',
-            chunk
-        ):
-            streamed_langs.add(m.group(1).lower())
+    for m in re.finditer(
+        r'\\*"hreflang\\*"\s*:\s*\\*"([a-zA-Z\-]+)\\*"',
+        html, re.IGNORECASE
+    ):
+        streamed_langs.add(m.group(1).lower())
 
     total_langs = toplevel_langs | streamed_langs
     total_count = len(total_langs)
@@ -114,15 +112,16 @@ def detect_hreflang(html: str) -> Dict:
     streamed_count = len(streamed_langs)
 
     if total_count == 0:
+        # Zero hreflang is NOT a failure: hreflang is only required for
+        # multi-locale sites. Failing here flagged every monolingual site.
         return {
             'total_count': 0,
             'toplevel_count': 0,
             'streamed_count': 0,
             'locales': [],
-            'status': 'fail',
+            'status': 'na',
             'evidence': (
-                'No hreflang tags detected in <head> or Next.js streaming data. '
-                'Multi-locale sites should declare hreflang per Google Search Central.'
+                'no hreflang declared — only required for multi-locale sites'
             )
         }
 

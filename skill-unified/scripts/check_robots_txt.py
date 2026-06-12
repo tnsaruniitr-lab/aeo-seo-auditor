@@ -25,6 +25,7 @@ Dependencies: curl, python3 (3.8+). stdlib only.
 """
 
 import json
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -81,7 +82,11 @@ def parse_robots_txt(body: str) -> Dict:
     last_was_ua = False
 
     def commit_group():
-        if current_uas and current_rules:
+        # Commit any group that names user-agents — even with zero
+        # Allow/Disallow rules (e.g. only Crawl-delay). An empty rule
+        # list means allow-all for those UAs; dropping the group would
+        # wrongly let the bot fall through to the wildcard group.
+        if current_uas:
             result['groups'].append({
                 'user_agents': list(current_uas),
                 'rules': list(current_rules),
@@ -143,22 +148,34 @@ def parse_robots_txt(body: str) -> Dict:
 
 def find_matching_groups(parsed: Dict, user_agent: str) -> List[Dict]:
     """
-    Find groups that match the given user_agent.
-    Precedence: specific UA match wins over wildcard (*).
-    If no specific match, use wildcard groups.
+    Find groups that match the given user_agent, per RFC 9309 §2.2.1 and
+    Google's robotstxt parser: a group token matches a crawler when the
+    token is a case-insensitive PREFIX of the crawler's product token
+    (group 'googlebot' matches crawler 'Googlebot-Image', but group
+    'googlebot-image' does NOT match crawler 'Googlebot').
+    The longest matching token wins; wildcard (*) groups apply only when
+    no specific token matches.
     """
     ua_lower = user_agent.lower()
-    specific = []
     wildcard = []
+    best_len = -1
+    best_groups: List[Dict] = []
     for group in parsed.get('groups', []):
+        group_match_len = -1
         for g_ua in group['user_agents']:
             g_lower = g_ua.lower()
             if g_lower == '*':
                 wildcard.append(group)
-            elif g_lower == ua_lower or ua_lower in g_lower or g_lower in ua_lower:
-                specific.append(group)
-                break
-    return specific if specific else wildcard
+            elif ua_lower.startswith(g_lower):
+                group_match_len = max(group_match_len, len(g_lower))
+        if group_match_len < 0:
+            continue
+        if group_match_len > best_len:
+            best_len = group_match_len
+            best_groups = [group]
+        elif group_match_len == best_len:
+            best_groups.append(group)
+    return best_groups if best_groups else wildcard
 
 
 def evaluate_path_access(groups: List[Dict], path: str) -> Tuple[bool, str]:
@@ -187,23 +204,28 @@ def evaluate_path_access(groups: List[Dict], path: str) -> Tuple[bool, str]:
             if not pattern:
                 continue
 
-            # Simple prefix match (robots.txt doesn't use full regex by default)
-            # Support the $ end-anchor
-            if pattern.endswith('$'):
-                if path == pattern[:-1]:
-                    if len(pattern) > best_match_len:
-                        best_match_len = len(pattern)
-                        best_directive = directive
-                        best_pattern = pattern
-            elif path.startswith(pattern):
-                if len(pattern) > best_match_len:
-                    best_match_len = len(pattern)
-                    best_directive = directive
-                    best_pattern = pattern
-                elif len(pattern) == best_match_len and directive == 'allow':
-                    # Allow wins tie
-                    best_directive = 'allow'
-                    best_pattern = pattern
+            # RFC 9309 §2.2.3: '*' matches any sequence of characters,
+            # trailing '$' anchors the match to the end of the path.
+            # Translate the pattern to a regex anchored at path start.
+            anchored = pattern.endswith('$')
+            core = pattern[:-1] if anchored else pattern
+            regex = re.escape(core).replace(r'\*', '.*')
+            if anchored:
+                regex += '$'
+            try:
+                matched = re.match(regex, path) is not None
+            except re.error:
+                continue
+            if not matched:
+                continue
+            if len(pattern) > best_match_len:
+                best_match_len = len(pattern)
+                best_directive = directive
+                best_pattern = pattern
+            elif len(pattern) == best_match_len and directive == 'allow':
+                # Allow wins tie
+                best_directive = 'allow'
+                best_pattern = pattern
 
     if best_directive is None:
         return True, 'no matching rule — permissive default'
@@ -222,15 +244,18 @@ def fetch_robots(base_url: str) -> Tuple[int, str, str]:
              '-A', USER_AGENT,
              '-w', '\n---HTTP_CODE---\n%{http_code}',
              robots_url],
-            capture_output=True, text=True, timeout=CURL_TIMEOUT + 3
+            capture_output=True, timeout=CURL_TIMEOUT + 3
         )
-        output = result.stdout
+        # Decode with errors='replace' — a single non-UTF-8 byte (e.g.
+        # Latin-1 comment) must not turn the whole fetch into a failure.
+        output = result.stdout.decode('utf-8', errors='replace')
+        stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
         if '\n---HTTP_CODE---\n' in output:
             body, code_str = output.rsplit('\n---HTTP_CODE---\n', 1)
             code = int(code_str.strip()) if code_str.strip().isdigit() else 0
         else:
             body, code = output, 0
-        return code, body, result.stderr or ''
+        return code, body, stderr
     except subprocess.TimeoutExpired:
         return 0, '', 'timeout'
     except FileNotFoundError:
@@ -245,8 +270,12 @@ def check_robots(target_url: str) -> Dict:
 
     parsed_url = urllib.parse.urlparse(target_url)
     target_path = parsed_url.path or '/'
+    # Rules can match on the query string too (e.g. Disallow: /*?print=1)
+    if parsed_url.query:
+        target_path += '?' + parsed_url.query
 
     http_code, body, err = fetch_robots(target_url)
+    robots_5xx = False
 
     # --- robots_reachable ---
     if http_code == 0:
@@ -256,11 +285,23 @@ def check_robots(target_url: str) -> Dict:
         }
         parsed = {'groups': [], 'sitemaps': [], 'empty': True, 'parse_warnings': []}
         robots_available = False
-    elif 400 <= http_code < 600:
+    elif 500 <= http_code < 600:
+        checks['robots_reachable'] = {
+            'status': 'fail', 'severity': 'high',
+            'evidence': f'robots.txt returned HTTP {http_code}. '
+                        f'Per RFC 9309 §2.3.1.4, 5xx means "unreachable" and '
+                        f'crawlers MUST assume complete disallow (Google: '
+                        f'for up to 30 days) — the site may be uncrawlable '
+                        f'until the server error is fixed.'
+        }
+        parsed = {'groups': [], 'sitemaps': [], 'empty': True, 'parse_warnings': []}
+        robots_available = False
+        robots_5xx = True
+    elif 400 <= http_code < 500:
         checks['robots_reachable'] = {
             'status': 'fail', 'severity': 'medium',
             'evidence': f'robots.txt returned HTTP {http_code}. '
-                        f'Per RFC 9309, 4xx/5xx means "no robots.txt" '
+                        f'Per RFC 9309 §2.3.1.3, 4xx means "no robots.txt" '
                         f'and crawlers apply permissive default.'
         }
         parsed = {'groups': [], 'sitemaps': [], 'empty': True, 'parse_warnings': []}
@@ -284,7 +325,13 @@ def check_robots(target_url: str) -> Dict:
         robots_available = True
 
     # --- robots_declares_sitemap ---
-    if parsed['sitemaps']:
+    if not robots_available:
+        checks['robots_declares_sitemap'] = {
+            'status': 'na', 'severity': 'medium',
+            'evidence': 'Cannot evaluate Sitemap: declarations — robots.txt '
+                        'is unreachable or returned an error.'
+        }
+    elif parsed['sitemaps']:
         checks['robots_declares_sitemap'] = {
             'status': 'pass', 'severity': 'info',
             'evidence': f'robots.txt declares {len(parsed["sitemaps"])} sitemap(s): '
@@ -317,8 +364,13 @@ def check_robots(target_url: str) -> Dict:
     else:
         checks['googlebot_allowed'] = {
             'status': 'warn', 'severity': 'medium',
-            'evidence': 'Cannot evaluate Googlebot access — robots.txt inaccessible. '
-                        'Permissive default assumes allowed, but should be verified.'
+            'evidence': (
+                'Cannot evaluate Googlebot access — robots.txt returned a 5xx '
+                'server error. Per RFC 9309 crawlers assume complete disallow '
+                'until it recovers.' if robots_5xx else
+                'Cannot evaluate Googlebot access — robots.txt inaccessible. '
+                'Permissive default assumes allowed, but should be verified.'
+            )
         }
 
     # --- ai_crawlers_all_allowed ---
@@ -360,7 +412,12 @@ def check_robots(target_url: str) -> Dict:
     else:
         checks['ai_crawlers_all_allowed'] = {
             'status': 'warn', 'severity': 'medium',
-            'evidence': 'Cannot evaluate AI crawler access — robots.txt inaccessible.'
+            'evidence': (
+                'Cannot evaluate AI crawler access — robots.txt returned a 5xx '
+                'server error. Per RFC 9309 crawlers assume complete disallow '
+                'until it recovers.' if robots_5xx else
+                'Cannot evaluate AI crawler access — robots.txt inaccessible.'
+            )
         }
 
     # --- target_path_not_disallowed (across all bots checked) ---
@@ -384,7 +441,12 @@ def check_robots(target_url: str) -> Dict:
     else:
         checks['target_path_not_disallowed'] = {
             'status': 'warn', 'severity': 'medium',
-            'evidence': f'Cannot evaluate target path access — robots.txt inaccessible.'
+            'evidence': (
+                'Cannot evaluate target path access — robots.txt returned a 5xx '
+                'server error. Per RFC 9309 crawlers assume complete disallow '
+                'until it recovers.' if robots_5xx else
+                'Cannot evaluate target path access — robots.txt inaccessible.'
+            )
         }
 
     return {

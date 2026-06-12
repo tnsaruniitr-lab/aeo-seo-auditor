@@ -9,6 +9,7 @@
 #   2. Does the server serve the same empty shell for every URL? (SPA-no-SSR detector)
 #   3. Is the site cloaking (different content per user-agent)?
 #   4. Is the content JS-rendered or actually in the raw HTML?
+#   5. Are bot UAs blocked (401/403/429) while browsers get content?
 #
 # Designed to produce identical output across runs when the underlying page is unchanged.
 
@@ -20,9 +21,21 @@ if [ "${1:-}" = "" ]; then
 fi
 
 URL="$1"
+
+# Default to https:// when no scheme is given, so curl doesn't misread the
+# input and the ORIGIN parse below always matches.
+case "$URL" in
+  http://*|https://*) ;;
+  *) URL="https://${URL}" ;;
+esac
+
 TMPDIR="${TMPDIR:-/tmp}"
 RUNID="$(date +%s)_$$"
 PREFIX="${TMPDIR}/bev_${RUNID}"
+
+# Clean up probe bodies on any exit path — under `set -e` a failing analyzer
+# would otherwise skip an rm placed at the bottom of the script.
+trap 'rm -f "${PREFIX}"_*.html' EXIT
 
 # Parse URL for origin + a guaranteed-404 path on the same origin
 ORIGIN=$(printf '%s' "$URL" | sed -E 's|(https?://[^/]+).*|\1|')
@@ -31,14 +44,25 @@ NONEXISTENT_URL="${ORIGIN}${NONEXISTENT_PATH}"
 
 # Four UA probes + one 404 probe
 # UAs cover: default, Googlebot, GPTBot, PerplexityBot, ClaudeBot
+#
+# -L: real crawlers (Googlebot, GPTBot, ClaudeBot, PerplexityBot) all follow
+# 3xx. Without it, an http:// input or non-canonical host yields an empty
+# 308 body that downstream classification misreads as an empty SPA shell
+# (somana.com false positive, 2026-06). --max-redirs caps loop risk; the
+# analyzer reports a final 3xx code as 'unresolved_redirect', not content.
+# --compressed: send Accept-Encoding and decode, so gzip-only servers don't
+# hand us binary. -w captures the FINAL hop's code plus the effective URL so
+# the analyzer can detect per-UA redirect divergence.
 fetch() {
   local ua="$1"; local out="$2"; local url="$3"
-  curl -sS --max-time 20 \
+  local res
+  res=$(curl -sS --max-time 20 -L --max-redirs 5 --compressed \
     -o "$out" \
-    -w "%{http_code} %{size_download} %{time_starttransfer}\n" \
+    -w "%{http_code} %{size_download} %{time_starttransfer} %{num_redirects} %{url_effective}" \
     -H "User-Agent: $ua" \
     -H "Cache-Control: no-cache" \
-    "$url" 2>/dev/null || echo "0 0 0"
+    "$url" 2>/dev/null) || res="000 0 0 0 -"
+  printf '%s\n' "$res"
 }
 
 # Run all probes
@@ -76,11 +100,5 @@ sys.stdout.write(json.dumps({'url': url, 'probe_url': probe_url, 'probes': probe
 PYEOF
 )
 
+# Last command's exit status is the script's; trap above handles cleanup.
 printf '%s' "$PAYLOAD" | python3 "$(dirname "$0")/_bev_analyze.py"
-PY_EXIT=$?
-
-# Clean up temp files
-rm -f "${PREFIX}_default.html" "${PREFIX}_gbot.html" "${PREFIX}_gpt.html" \
-      "${PREFIX}_perp.html" "${PREFIX}_claude.html" "${PREFIX}_404.html"
-
-exit "$PY_EXIT"

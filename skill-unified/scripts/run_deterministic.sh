@@ -33,6 +33,14 @@ if [ "${1:-}" = "" ]; then
 fi
 
 URL="$1"
+
+# Default to https:// when no scheme is given — children derive the origin
+# from this URL and a scheme-less input breaks every one of them.
+case "$URL" in
+  http://*|https://*) ;;
+  *) URL="https://${URL}" ;;
+esac
+
 MODE="${2:-json}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PER_SCRIPT_TIMEOUT=60
@@ -284,19 +292,20 @@ if mode == 'human':
 
     print('PHASE 1 — Bot\'s Eye View')
     print('-' * 75)
-    if 'page_identity' in bev:
+    if isinstance(bev.get('summary'), dict):
+        s = bev['summary']
+        dprobe = (bev.get('probes') or {}).get('default', {})
         print(f'Classification: {bev.get("classification")}')
-        pi = bev['page_identity']
-        print(f'Title: {pi.get("title")}')
-        print(f'H1 count: {pi.get("h1_count")} — first: {pi.get("h1_first")}')
-        cvb = bev.get('content_visible_to_bots', {})
-        print(f'Visible words (raw HTML): {cvb.get("visible_word_count")}')
-        print(f'FAQ visible: {cvb.get("faq_visible_pairs")} pairs '
-              f'(via {cvb.get("faq_visible_detection_method")})')
-        print(f'FAQ in schema: {cvb.get("faq_schema_pairs")} pairs')
-        summary = bev.get('summary', {})
-        print(f'Same HTML as 404: {summary.get("same_html_as_404_url")}')
-        print(f'Cloaking: {summary.get("cloaking_detected")}')
+        print(f'HTTP (default UA): {s.get("http_code_default")} '
+              f'after {s.get("redirects_followed", 0)} redirect(s) '
+              f'→ {s.get("final_url") or bev.get("url")}')
+        print(f'First H1: {dprobe.get("h1_first")}')
+        print(f'Visible words (raw HTML): {s.get("visible_words_default")}')
+        print(f'FAQ visible: {s.get("faq_visible")} pairs — '
+              f'in schema: {s.get("faq_schema")} ({s.get("faq_integrity")})')
+        print(f'Same HTML as 404: {s.get("same_html_as_404_url")}')
+        print(f'Cloaking: {s.get("cloaking_detected")} — '
+              f'Bot blocking: {s.get("bot_blocking_detected")}')
     elif '_child_status' in bev:
         print(f'Unavailable: child_status={bev["_child_status"]}')
     print()

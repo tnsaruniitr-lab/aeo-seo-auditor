@@ -223,13 +223,34 @@ and `$TARGET_URL` is the audited URL.
 #### What the scripts produce
 
 **Phase 1.6 — Bot's Eye View JSON (from `bots_eye_view.sh`):**
-- `classification` — one of: `fully_accessible`, `partial_ssr`, `js_dependent`, `minimal_content`, `spa_no_ssr`
+- `classification` — content classes: `fully_accessible`, `partial_ssr`, `js_dependent`,
+  `minimal_content`, `spa_no_ssr`, `ssr_shell_js_hidden_content` — plus transport classes:
+  `unresolved_redirect`, `bot_blocked`, `http_error`, `fetch_failed`
+- **TRANSPORT CLASSES MEAN THE PROBE WAS INCONCLUSIVE.** If classification is
+  `unresolved_redirect`, `http_error`, or `fetch_failed`, the analyzed body is NOT the
+  page (it is a redirect stub, error page, or nothing). Write ZERO content findings
+  (no word counts, no "SPA", no FAQ claims) — report the transport problem itself and,
+  for `unresolved_redirect`, re-run against `summary.final_url`. `bot_blocked` (401/403/429
+  on the default UA) IS a reportable finding: the site denies non-browser clients.
+- `summary.http_code_default`, `summary.final_url`, `summary.redirects_followed` — probes
+  follow up to 5 redirects like real crawlers; final URL ≠ input URL is normal (http→https)
 - `summary.same_html_as_404_url` — **CRITICAL BOOLEAN** — if true, the site is a SPA without SSR
-- `summary.cloaking_detected` — true if bot UAs get different byte counts than human UAs
-- `summary.spa_framework_signals` — detects `<app-root>` (Angular), `__NEXT_DATA__` (Next.js), etc.
-- `page_identity.title`, `h1_first`, `h1_count`, `canonical_tag`, `meta_description`, `meta_robots`
-- `content_visible_to_bots.visible_word_count`, `schema_block_count`, `faq_visible_pairs`, `faq_schema_pairs`, `faq_integrity`
-- `response_per_bot.{default_ua,googlebot,gptbot,perplexitybot,claudebot,probe_404}.size_bytes` — for cloaking + 404-shell detection
+- `summary.cloaking_detected` — bot UAs receive significantly different content (only
+  compared between successful 2xx probes)
+- `summary.bot_blocking_detected` + top-level `bot_blocking` — AI-bot UAs get 4xx while the
+  browser UA gets 2xx. This is access denial, NOT cloaking and NOT thin content.
+- `summary.visible_words_default`, `summary.spa_signals`
+- `summary.faq_visible` / `faq_schema` / `faq_schema_questions_visible` / `faq_integrity`
+  (`na` | `ok` | `ok_text_match` | `partial_text_match` | `mismatch`) — `ok_text_match` means
+  every schema question's text IS present in the visible HTML even though no FAQ widget
+  pattern matched (Framer/custom markup). Do NOT report "FAQ markup disqualified" unless
+  integrity is `mismatch` or `partial_text_match`, and then quote
+  `faq_schema_questions_visible` of `faq_schema` as the evidence.
+- `summary.critical_issues` — quote these verbatim; an empty array means none
+- `probes.{default,gbot,gpt,perp,claude,not_found}` — per-UA: `http_code`, `size_bytes`,
+  `ttfb_seconds`, `redirects_followed`, `final_url`, `visible_words`, `faq_visible`,
+  `faq_schema`, `spa_signals`, `h1_first`
+- `divergent_final_urls` — bot UAs redirected to a different final URL than the browser UA
 
 **Phase 1.7 — 9 deterministic checks (from `deterministic_checks.py`):**
 

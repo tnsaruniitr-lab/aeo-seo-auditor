@@ -244,14 +244,31 @@ FIELD_SPECS = {
 }
 
 
+class _Redirect308Handler(urllib.request.HTTPRedirectHandler):
+    """urllib follows 308 Permanent Redirect only from Python 3.11; alias to 307
+    so http→https 308s (Vercel/Framer hosts) don't abort the whole check.
+    The base redirect_request also has a hardcoded (301,302,303,307) allowlist
+    on Python < 3.11, so 308 must be presented to it as 307."""
+    http_error_308 = urllib.request.HTTPRedirectHandler.http_error_307
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return super().redirect_request(
+            req, fp, 307 if code == 308 else code, msg, headers, newurl)
+
+
 def fetch_html(url, timeout=15):
-    """Fetch HTML from URL."""
+    """Fetch HTML from URL. Returns (html, http_status, error)."""
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (AuditBot/1.0)'})
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        return resp.read().decode('utf-8', errors='replace'), resp.status
-    except (HTTPError, URLError, Exception):
-        return None, 0
+        opener = urllib.request.build_opener(_Redirect308Handler())
+        resp = opener.open(req, timeout=timeout)
+        return resp.read().decode('utf-8', errors='replace'), resp.status, None
+    except HTTPError as e:
+        # Keep the real status code — a CDN 403 ("blocked") must stay
+        # distinguishable from a network failure (status 0).
+        return None, e.code, f'HTTP {e.code} {e.reason}'
+    except (URLError, Exception) as e:
+        return None, 0, f'{type(e).__name__}: {e}'
 
 
 def extract_schema_blocks(html):
@@ -287,6 +304,12 @@ def flatten_entities(blocks):
                 entities.append(obj)
             # Recurse into nested objects
             for key, val in obj.items():
+                if key == '@graph':
+                    # @graph is a structural wrapper, not nesting — recurse
+                    # at the same depth so list-wrapped @graph blocks
+                    # ([{"@graph": [...]}]) are reached too.
+                    walk(val, depth)
+                    continue
                 if key.startswith('@'):
                     continue
                 if isinstance(val, (dict, list)):
@@ -298,21 +321,27 @@ def flatten_entities(blocks):
     for block in blocks:
         if isinstance(block, dict) and '__parse_error' in block:
             continue
-        if isinstance(block, dict) and '@graph' in block and isinstance(block['@graph'], list):
-            for item in block['@graph']:
-                walk(item)
-        else:
-            walk(block)
+        walk(block)
 
     return entities
 
 
 def normalize_type(type_value):
-    """Normalize @type — can be string or array of strings. Return primary type string."""
+    """
+    Normalize @type — can be string or array of strings. Return primary type string.
+    For arrays, prefer the first element that HAS a validation spec
+    (["Physiotherapy", "LocalBusiness"] → LocalBusiness); fall back to the
+    first string element if none do. Non-string elements are skipped.
+    """
     if isinstance(type_value, str):
         return type_value
     if isinstance(type_value, list) and len(type_value) > 0:
-        return type_value[0]
+        str_types = [t for t in type_value if isinstance(t, str)]
+        for t in str_types:
+            if t in FIELD_SPECS:
+                return t
+        if str_types:
+            return str_types[0]
     return 'Unknown'
 
 
@@ -356,15 +385,21 @@ def validate_entity(entity):
     custom_issues = []
     if entity_type == 'FAQPage':
         main_entity = entity.get('mainEntity', [])
+        if isinstance(main_entity, dict):
+            # A single Question object is valid JSON-LD — treat as 1-item list
+            main_entity = [main_entity]
         if not isinstance(main_entity, list):
             custom_issues.append('mainEntity is not an array')
         elif len(main_entity) == 0:
             custom_issues.append('mainEntity is empty')
         else:
             for i, q in enumerate(main_entity):
+                q_types = q.get('@type') if isinstance(q, dict) else None
+                if not isinstance(q_types, list):
+                    q_types = [q_types]
                 if not isinstance(q, dict):
                     custom_issues.append(f'mainEntity[{i}] is not an object')
-                elif q.get('@type') != 'Question':
+                elif 'Question' not in q_types:
                     custom_issues.append(f'mainEntity[{i}] has @type={q.get("@type")}, expected Question')
                 elif not q.get('name'):
                     custom_issues.append(f'mainEntity[{i}] missing name')
@@ -382,8 +417,13 @@ def validate_entity(entity):
             for i, item in enumerate(items):
                 if isinstance(item, dict):
                     pos = item.get('position')
+                    # Coerce string positions ("1") — common and Google-tolerated
+                    try:
+                        pos = int(pos)
+                    except (TypeError, ValueError):
+                        pass
                     if pos != expected_pos:
-                        custom_issues.append(f'itemListElement[{i}] position={pos}, expected {expected_pos}')
+                        custom_issues.append(f'itemListElement[{i}] position={item.get("position")}, expected {expected_pos}')
                     expected_pos += 1
 
     # Determine overall status
@@ -413,13 +453,20 @@ def main():
         sys.exit(1)
 
     url = sys.argv[1]
-    html, status = fetch_html(url)
+    html, status, fetch_error = fetch_html(url)
 
     if not html:
+        if status == 403:
+            error_msg = 'blocked by server (HTTP 403 — likely bot challenge or WAF), could not audit schema'
+        elif status >= 400:
+            error_msg = f'could not fetch HTML (HTTP {status})'
+        else:
+            error_msg = 'could not fetch HTML'
         print(json.dumps({
             'url': url,
-            'error': 'could not fetch HTML',
+            'error': error_msg,
             'http_status': status,
+            'fetch_error': fetch_error,
         }))
         sys.exit(0)
 
@@ -475,7 +522,7 @@ def main():
     else:
         checks['schema_entities_present'] = {
             'status': 'pass',
-            'evidence': f'{total} schema entities found across {len(blocks)} JSON-LD block(s). Types: {list(set(v["type"] for v in validations))}.',
+            'evidence': f'{total} schema entities found across {len(blocks)} JSON-LD block(s). Types: {sorted(set(v["type"] for v in validations))}.',
             'detail': {'entity_count': total, 'block_count': len(blocks)}
         }
 
@@ -547,11 +594,11 @@ def main():
 
     # Check 6: unknown types (no spec)
     if no_spec:
-        unknown_types = set(v['type'] for v in no_spec)
+        unknown_types = sorted(set(v['type'] for v in no_spec))
         checks['known_schema_types'] = {
             'status': 'warn',
-            'evidence': f'{len(no_spec)} entities have types not in validator spec: {list(unknown_types)}. Not validated for completeness.',
-            'detail': {'unknown_types': list(unknown_types)}
+            'evidence': f'{len(no_spec)} entities have types not in validator spec: {unknown_types}. Not validated for completeness.',
+            'detail': {'unknown_types': unknown_types}
         }
 
     # Return full output

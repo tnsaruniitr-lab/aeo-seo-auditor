@@ -235,3 +235,105 @@ readers.
    Separate fix — use curl for competitor fetches.
 5. **Chrome MCP LCP capture remains approximate.** Documented in
    `scripts/README.md` Chrome caveats section.
+
+---
+
+# 2026-06-12 — Robustness pass (skill-unified + live skill)
+
+Trigger: the somana.com audit false positive. The site was audited as
+`http://somana.com`; the server answers http with a 308 (empty body) and the
+probe didn't follow redirects, so the report claimed "JS-only SPA, 0 visible
+words" about a fully pre-rendered Framer site. A full code audit of
+`skill-unified/scripts/` followed; 40+ verified findings fixed. The live copy
+at `.claude/skills/website-seo-aeo-auditor/scripts/` is synced. `skill/scripts/`
+and `scripts-v2/` are LEGACY lineages — do not edit them; `skill-unified/` is
+canonical.
+
+## bots_eye_view.sh + _bev_analyze.py (the false-positive chain)
+- curl now uses `-L --max-redirs 5 --compressed`; `-w` adds `%{num_redirects}`
+  and `%{url_effective}` (parser is back-compatible with 3-field strings).
+- `classify_ssr()` gates on http_code FIRST: new transport classes
+  `unresolved_redirect`, `bot_blocked` (401/403/429), `http_error`,
+  `fetch_failed` — an empty redirect/error body can never again classify as
+  "SPA / minimal content".
+- Bot blocking (browser UA 2xx, bot UA 4xx) is now its own finding and is
+  excluded from the cloaking word-count comparison. Per-UA divergent final
+  URLs are reported (`divergent_final_urls`).
+- FAQ ground truth: schema questions are text-matched against visible HTML
+  (`faq_schema_questions_visible`, integrity classes `ok_text_match` /
+  `partial_text_match`) — fixes the false "FAQ markup disqualified" claim on
+  Framer/custom-markup sites. FAQPage parsing handles `@type` arrays,
+  single-dict `mainEntity`, multiple blocks, HTML-escaped JSON-LD.
+- `looks_like_question()` knows German question words.
+- `summary` now actually contains the keys the orchestrator reads
+  (`critical_issues`, `same_html_as_404_url`, `cloaking_detected`, …) — they
+  were silently absent before. Scheme-less URLs normalized to https. Temp
+  files cleaned via trap; dead `PY_EXIT` logic removed.
+
+## deterministic_checks.py (+ extras)
+- Per-check crash isolation in `run_all_checks` (one bad check → `na`, not a
+  dead process); J2 TypeError on non-string JSON-LD names fixed.
+- HTTP status gating: non-2xx page → all checks `na` with accurate evidence,
+  `content_checks_skipped: true`.
+- urllib 308 support (Python < 3.11 doesn't follow 308): RecordingHandler /
+  _Redirect308Handler alias 308→307 in both this file and
+  check_schema_completeness.py.
+- A4b canonical: attribute order/quoting agnostic, `urljoin` for relative
+  hrefs, fragment stripped, scheme/host lowercased.
+- D9: `@type` arrays, dict `mainEntity`, accumulation across blocks, and the
+  same schema-question text-match fallback as the BEV analyzer (pass/warn
+  instead of false fail when the text is visible without a widget pattern).
+- D12: author/founder as lists of Person; `@type` arrays.
+- C12b: unparseable/future-only dates → `warn` (was silent `pass` with
+  contradictory evidence); date-only stamps exempt from the 60s cosmetic
+  window.
+- B1 TTFB: no more cache-busting query param (measures CDN reality), `-L`,
+  non-2xx samples discarded and counted; invalid `%{header_...}` removed.
+- A2b: status-aware (non-2xx → na; soft-404 wording vs SPA-shell claim);
+  fixed probe slug (deterministic output). A7b: heading auto-close semantics
+  (no false "nested H1" on unclosed h2). Charset-aware body decoding.
+  Shared `extract_jsonld_blocks()`. hreflang: zero declarations → `na` (was
+  fail for every monolingual site); streamed-hreflang scan no longer
+  truncates at the first `)` and is case-insensitive.
+
+## check_robots_txt.py
+- UA-group matching per RFC 9309/Google parser: prefix match, longest token
+  wins (was bidirectional substring — selected `Googlebot-Image` groups for
+  Googlebot). `*`/`$` wildcards in Allow/Disallow translated to regex,
+  longest-match precedence, Allow wins ties (were treated as literals).
+  Groups with only Crawl-delay etc. are kept (allow-all), not dropped.
+- 5xx robots.txt = assume complete disallow (was claimed "permissive").
+  Decoding errors='replace'. Query string included in path evaluation.
+  Sitemap-directive check is `na` when robots.txt unreachable.
+
+## check_sitemap.py
+- Gzipped sitemaps (.gz bodies) gunzipped instead of crashing the UTF-8
+  decode into "fetch failed". URL comparison normalized both ways
+  (scheme/www/trailing slash). 50k limit applied per FILE not aggregate.
+  Truncated traversals flagged (`truncated: true`) and demote "not in
+  sitemap" to warn. ALL robots `Sitemap:` directives traversed. 403s on
+  sampled URLs reported as "blocked", not dead; evidence matches predicate.
+
+## check_schema_completeness.py
+- `@graph` reachable inside list-wrapped blocks (was "No schema entities
+  found" for valid markup). Multi-type `@type` arrays validated against the
+  first type with a spec; non-string types no longer crash. Single-dict
+  `mainEntity` and `@type: ["Question"]` accepted. HTTPError keeps its real
+  code (403 reads "blocked", not "could not fetch"). Deterministic ordering
+  (`sorted`). String breadcrumb positions coerced.
+
+## run_deterministic.sh + SKILL.md + tests
+- Orchestrator normalizes scheme-less URLs; human mode reads the analyzer's
+  real keys (`page_identity` / `content_visible_to_bots` never existed).
+- SKILL.md Phase 1.6 contract rewritten to the analyzer's actual output,
+  including how to interpret transport classes ("probe inconclusive — write
+  zero content findings").
+- tests/run_tests.sh: +13 assertions (tests 9–11) covering transport gating,
+  curl -w parsing (new + legacy), FAQ @type arrays / dict mainEntity /
+  text-match, German question detection. 32 passed, 0 failed.
+
+End-to-end verification: `run_deterministic.sh http://somana.com` now yields
+classification `fully_accessible`, 27/27 checks run, and only genuine
+findings (1 of 6 FAQ questions not visible, FAQPage missing @id, no Person
+schema, 0/90 sitemap lastmod). reddit.com correctly reports bot blocking
+(gbot/gpt 403, claude 429) instead of "cloaking".

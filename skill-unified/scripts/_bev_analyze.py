@@ -101,6 +101,12 @@ _QUESTION_WORDS = (
     'is ', 'are ', 'was ', 'were ',
     'will ', 'would ', 'should ', 'shall ', 'may ', 'might ',
     'have ', 'has ', 'had ',
+    # German — most German FAQs end in '?', but accordion summaries often
+    # truncate it, and DE-market sites are a primary audit target.
+    'wie ', 'was ', 'wann ', 'wo ', 'warum ', 'wieso ', 'weshalb ',
+    'welche', 'wer ', 'wem ', 'wen ', 'gibt es ',
+    'kann ', 'können ', 'muss ', 'müssen ', 'darf ', 'soll ',
+    'ist ', 'sind ', 'habe ', 'brauche ', 'bietet ',
 )
 
 
@@ -187,33 +193,78 @@ def faq_visible_count(html_str: str) -> Tuple[int, str]:
 # FAQ schema count (unchanged logic; safe)
 # ----------------------------------------------------------------------
 
-def faq_schema_count(html_str: str) -> int:
-    """Count FAQ pairs in FAQPage JSON-LD, if present."""
+def _is_faqpage(node: Dict) -> bool:
+    """True if a JSON-LD node declares FAQPage, including @type arrays."""
+    t = node.get('@type')
+    types = t if isinstance(t, list) else [t]
+    return any(isinstance(x, str) and x.strip().lower() == 'faqpage'
+               for x in types)
+
+
+def _mainentity_count(node: Dict) -> int:
+    """Q&A pair count for a FAQPage node; single-dict mainEntity counts as 1."""
+    me = node.get('mainEntity', [])
+    if isinstance(me, dict):
+        return 1
+    if isinstance(me, list):
+        return len(me)
+    return 0
+
+
+def _iter_jsonld_nodes(html_str: str):
+    """Yield every dict node from all JSON-LD blocks, descending into @graph."""
     blocks = re.findall(
         r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html_str, re.IGNORECASE | re.DOTALL
     )
     for b in blocks:
-        try:
-            data = json.loads(b.strip())
-        except json.JSONDecodeError:
+        data = None
+        # Some CMSs HTML-escape entities inside JSON-LD; retry unescaped.
+        for attempt in (b.strip(), html_lib.unescape(b).strip()):
+            try:
+                data = json.loads(attempt)
+                break
+            except json.JSONDecodeError:
+                continue
+        if data is None:
             continue
-        items = data if isinstance(data, list) else [data]
-        for item in items:
+        stack = list(data) if isinstance(data, list) else [data]
+        while stack:
+            item = stack.pop()
             if not isinstance(item, dict):
                 continue
-            if item.get('@type') == 'FAQPage':
-                me = item.get('mainEntity', [])
-                if isinstance(me, list):
-                    return len(me)
-            graph = item.get('@graph', [])
+            yield item
+            graph = item.get('@graph')
             if isinstance(graph, list):
-                for g in graph:
-                    if isinstance(g, dict) and g.get('@type') == 'FAQPage':
-                        me = g.get('mainEntity', [])
-                        if isinstance(me, list):
-                            return len(me)
-    return 0
+                stack.extend(g for g in graph if isinstance(g, dict))
+
+
+def faq_schema_count(html_str: str) -> int:
+    """Count FAQ pairs across ALL FAQPage JSON-LD blocks, if present."""
+    return sum(_mainentity_count(node) for node in _iter_jsonld_nodes(html_str)
+               if _is_faqpage(node))
+
+
+def faq_schema_questions(html_str: str) -> List[str]:
+    """Question texts ('name' of mainEntity items) from FAQPage JSON-LD."""
+    questions: List[str] = []
+    for node in _iter_jsonld_nodes(html_str):
+        if not _is_faqpage(node):
+            continue
+        me = node.get('mainEntity', [])
+        items = [me] if isinstance(me, dict) else me if isinstance(me, list) else []
+        for q in items:
+            if isinstance(q, dict) and isinstance(q.get('name'), str):
+                questions.append(q['name'])
+    return questions
+
+
+def _norm_for_match(s: str) -> str:
+    """Normalize text for substring matching: entities, curly quotes, case, ws."""
+    s = html_lib.unescape(s or '')
+    s = (s.replace('’', "'").replace('‘', "'")
+          .replace('“', '"').replace('”', '"'))
+    return re.sub(r'\s+', ' ', s).strip().casefold()
 
 
 # ----------------------------------------------------------------------
@@ -252,11 +303,17 @@ def classify_ssr(
     spa_signals: List[str],
     h1_first: Optional[str] = None,
     html_snippet: Optional[str] = None,
+    http_code: Optional[int] = None,
 ) -> str:
     """
     Deterministic classification based on signals.
 
     Returns one of:
+      - 'fetch_failed'               — curl error / timeout; no response at all.
+      - 'unresolved_redirect'        — final hop is still 3xx; body is NOT the
+                                        page, do not draw content conclusions.
+      - 'bot_blocked'                — 401/403/429; access denied, not thin content.
+      - 'http_error'                 — other 4xx/5xx; body is an error page.
       - 'spa_no_ssr'                 — Identical shell for every URL. Dark to AI.
       - 'ssr_shell_js_hidden_content' — SSR works but only a modal/gate is rendered;
                                          real content is in the JS bundle. (NEW)
@@ -265,6 +322,19 @@ def classify_ssr(
       - 'partial_ssr'                — 200-500 words.
       - 'fully_accessible'           — >500 words of real content in raw HTML.
     """
+    # Transport gate first: a non-2xx body is not the page's content, so
+    # word-count classes don't apply. This is what previously turned an
+    # unfollowed 308 (empty body) into a false "JS-only SPA" verdict.
+    if http_code is not None:
+        if http_code <= 0:
+            return 'fetch_failed'
+        if 300 <= http_code < 400:
+            return 'unresolved_redirect'
+        if http_code in (401, 403, 429):
+            return 'bot_blocked'
+        if http_code >= 400:
+            return 'http_error'
+
     if same_as_404:
         return 'spa_no_ssr'
 
@@ -305,16 +375,30 @@ def safe_read(path: str) -> str:
 
 
 def parse_curl_result(result_str: str) -> Dict:
-    """Parse 'HTTP_CODE SIZE TTFB' string from curl -w output."""
+    """
+    Parse 'HTTP_CODE SIZE TTFB [NUM_REDIRECTS FINAL_URL]' from curl -w output.
+
+    The last two fields were added when -L (follow redirects) was introduced;
+    older 3-field strings still parse (back-compat with stored payloads).
+    """
     parts = result_str.strip().split()
+    out = {'http_code': 0, 'size_bytes': 0, 'ttfb_seconds': 0.0,
+           'num_redirects': 0, 'final_url': ''}
     try:
-        return {
-            'http_code': int(parts[0]) if len(parts) > 0 else 0,
-            'size_bytes': int(parts[1]) if len(parts) > 1 else 0,
-            'ttfb_seconds': float(parts[2]) if len(parts) > 2 else 0.0,
-        }
+        if len(parts) > 0:
+            out['http_code'] = int(parts[0])
+        if len(parts) > 1:
+            out['size_bytes'] = int(parts[1])
+        if len(parts) > 2:
+            out['ttfb_seconds'] = float(parts[2])
+        if len(parts) > 3:
+            out['num_redirects'] = int(parts[3])
+        if len(parts) > 4 and parts[4] != '-':
+            out['final_url'] = parts[4]
     except (ValueError, IndexError):
-        return {'http_code': 0, 'size_bytes': 0, 'ttfb_seconds': 0.0}
+        return {'http_code': 0, 'size_bytes': 0, 'ttfb_seconds': 0.0,
+                'num_redirects': 0, 'final_url': ''}
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -348,16 +432,30 @@ def _normalize_for_equality(html_str: str) -> str:
 def analyze_probe(html_str: str, curl_result: str) -> Dict:
     """Analyze a single UA probe. Returns dict of all derived signals."""
     curl = parse_curl_result(curl_result)
-    visible = visible_text(html_str)
+    # Higher cap than the default 50k: FAQ sections usually sit at the end
+    # of the page and must not be truncated away before the match below.
+    visible = visible_text(html_str, max_chars=300_000)
     wc = len([w for w in visible.split() if w.strip()])
     faq_vc, faq_method = faq_visible_count(html_str)
+    # Ground truth for Google's FAQPage policy: does each question declared
+    # in JSON-LD appear in the visible text? Widget-pattern detection
+    # (faq_visible_count) misses builders like Framer whose markup matches
+    # no known accordion pattern even though the text is fully visible.
+    schema_qs = faq_schema_questions(html_str)
+    vis_norm = _norm_for_match(visible)
+    schema_qs_visible = sum(
+        1 for q in schema_qs if _norm_for_match(q) and _norm_for_match(q) in vis_norm
+    )
     return {
         'http_code': curl['http_code'],
         'size_bytes': curl['size_bytes'],
         'ttfb_seconds': round(curl['ttfb_seconds'], 3),
+        'redirects_followed': curl['num_redirects'],
+        'final_url': curl['final_url'],
         'visible_words': wc,
         'faq_visible': {'count': faq_vc, 'method': faq_method},
         'faq_schema': faq_schema_count(html_str),
+        'faq_schema_questions_visible': schema_qs_visible,
         'spa_signals': detect_spa_signals(html_str),
         'h1_first': extract_first_h1(html_str),
     }
@@ -408,13 +506,34 @@ def _run_cli(payload: Dict) -> Dict:
             )
         )
 
-    # Cloaking: flag if any bot UA's visible-word count differs from default
-    # by > 20% and > 50 words. Conservative threshold to avoid noise.
-    default_wc = per_probe.get('default', {}).get('visible_words', 0)
+    d = per_probe.get('default', {})
+    default_wc = d.get('visible_words', 0)
+    default_code = d.get('http_code', 0)
+    default_ok = 200 <= default_code < 300
+    default_final = d.get('final_url', '')
+
+    # Bot blocking vs cloaking are different findings. A 403/429 to GPTBot
+    # while the browser UA gets 200 is access denial — comparing its error
+    # page's word count against the real page would misfire as "cloaking".
     cloaking_deltas: List[Dict] = []
     cloaking_detected = False
+    bot_blocking: List[Dict] = []
+    divergent_final_urls: List[Dict] = []
     for name in ('gbot', 'gpt', 'perp', 'claude'):
-        probe_wc = per_probe.get(name, {}).get('visible_words', 0)
+        p = per_probe.get(name, {})
+        code = p.get('http_code', 0)
+        ok = 200 <= code < 300
+        if default_ok and not ok:
+            bot_blocking.append({'probe': name, 'http_code': code})
+            continue
+        final = p.get('final_url', '')
+        if default_final and final and final != default_final:
+            divergent_final_urls.append(
+                {'probe': name, 'final_url': final, 'default_final_url': default_final}
+            )
+        if not (default_ok and ok):
+            continue
+        probe_wc = p.get('visible_words', 0)
         if default_wc == 0 and probe_wc == 0:
             continue
         delta = probe_wc - default_wc
@@ -428,20 +547,57 @@ def _run_cli(payload: Dict) -> Dict:
     classification = classify_ssr(
         visible_words=default_wc,
         same_as_404=same_as_404,
-        spa_signals=per_probe.get('default', {}).get('spa_signals', []),
-        h1_first=per_probe.get('default', {}).get('h1_first'),
+        spa_signals=d.get('spa_signals', []),
+        h1_first=d.get('h1_first'),
         html_snippet=default_html,
+        http_code=default_code,
     )
 
-    d = per_probe.get('default', {})
     visible_faq = d.get('faq_visible', {}).get('count', 0)
     schema_faq = d.get('faq_schema', 0)
+    schema_q_visible = d.get('faq_schema_questions_visible', 0)
     if visible_faq == 0 and schema_faq == 0:
         faq_integrity = 'na'
     elif visible_faq == schema_faq:
         faq_integrity = 'ok'
+    elif schema_faq > 0 and schema_q_visible >= schema_faq:
+        # Every schema question's text IS in the visible HTML — Google's
+        # actual requirement — even though no FAQ widget pattern matched.
+        faq_integrity = 'ok_text_match'
+    elif schema_faq > 0 and schema_q_visible >= (schema_faq + 1) // 2:
+        faq_integrity = 'partial_text_match'
     else:
         faq_integrity = 'mismatch'
+
+    # Critical issues the orchestrator surfaces verbatim. Transport-level
+    # classifications mean "probe inconclusive — fix the fetch, re-run",
+    # and must never read as content conclusions.
+    critical_issues: List[str] = []
+    if classification == 'fetch_failed':
+        critical_issues.append(
+            'Probe inconclusive: fetch failed (timeout/connection error) — no content conclusions possible')
+    elif classification == 'unresolved_redirect':
+        critical_issues.append(
+            f'Probe inconclusive: final response is still a redirect (HTTP {default_code}) '
+            f'after following up to 5 hops — re-run against the final URL')
+    elif classification == 'bot_blocked':
+        critical_issues.append(
+            f'Default UA is blocked (HTTP {default_code}) — site denies non-browser clients')
+    elif classification == 'http_error':
+        critical_issues.append(
+            f'Page returns HTTP {default_code} — analyzed body is an error page')
+    elif classification == 'spa_no_ssr':
+        critical_issues.append(
+            'Page serves the identical shell for real and 404 URLs — content is JS-only, dark to AI crawlers')
+    if bot_blocking:
+        blocked = ', '.join(f"{b['probe']}={b['http_code']}" for b in bot_blocking)
+        critical_issues.append(f'AI-bot user agents blocked while browser UA succeeds: {blocked}')
+    if cloaking_detected:
+        critical_issues.append('Cloaking suspected: bot UAs receive significantly different content')
+    if faq_integrity in ('mismatch', 'partial_text_match'):
+        critical_issues.append(
+            f'FAQ schema/HTML mismatch: {schema_faq} pairs in JSON-LD, '
+            f'{schema_q_visible} question texts found in visible HTML')
 
     return {
         'url': url,
@@ -450,13 +606,26 @@ def _run_cli(payload: Dict) -> Dict:
         'same_as_404': same_as_404,
         'cloaking_detected': cloaking_detected,
         'cloaking_deltas': cloaking_deltas,
+        'bot_blocking_detected': bool(bot_blocking),
+        'bot_blocking': bot_blocking,
+        'divergent_final_urls': divergent_final_urls,
         'classification': classification,
         'summary': {
+            'http_code_default': default_code,
+            'final_url': default_final,
+            'redirects_followed': d.get('redirects_followed', 0),
             'visible_words_default': default_wc,
-            'spa_signals': per_probe.get('default', {}).get('spa_signals', []),
+            'spa_signals': d.get('spa_signals', []),
             'faq_visible': visible_faq,
             'faq_schema': schema_faq,
+            'faq_schema_questions_visible': schema_q_visible,
             'faq_integrity': faq_integrity,
+            # Key names the orchestrator's human mode reads — previously it
+            # looked these up in summary and always got None.
+            'same_html_as_404_url': same_as_404,
+            'cloaking_detected': cloaking_detected,
+            'bot_blocking_detected': bool(bot_blocking),
+            'critical_issues': critical_issues,
         },
     }
 
