@@ -1197,6 +1197,9 @@ def healthz():
                 os.getenv('SUPABASE_URL') and os.getenv('SUPABASE_SERVICE_KEY')
             ),
             'output_dir': str(OUTPUT_DIR),
+            # Railway injects the deployed commit; lets callers verify which
+            # build is live without a dashboard login.
+            'git_sha': os.getenv('RAILWAY_GIT_COMMIT_SHA'),
         }
     except Exception as e:
         return JSONResponse(
