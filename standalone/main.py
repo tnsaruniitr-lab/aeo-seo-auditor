@@ -385,6 +385,33 @@ def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(_basic)):
     return True
 
 
+def require_admin(request: Request,
+                  credentials: Optional[HTTPBasicCredentials] = Depends(_basic)):
+    """Auth for destructive admin ops (delete / suppress). Passes when EITHER
+    a valid X-API-Key (server-to-server) OR valid HTTP Basic credentials (a
+    logged-in browser admin) are presented — so the homepage delete button
+    works without embedding the API key in client JS. Fail-closed in
+    production when no auth is configured at all."""
+    if API_KEY_ENABLED:
+        key = request.headers.get('X-API-Key', '')
+        if key and secrets.compare_digest(key, AUDIT_API_KEY):
+            return True
+    if AUTH_ENABLED and credentials is not None:
+        if (secrets.compare_digest(credentials.username, AUDIT_USERNAME)
+                and secrets.compare_digest(credentials.password, AUDIT_PASSWORD)):
+            return True
+    if not API_KEY_ENABLED and not AUTH_ENABLED:
+        # Nothing configured. Fail closed in production, allow in local dev.
+        if IS_PRODUCTION:
+            raise HTTPException(status_code=503, detail='Admin auth not configured')
+        return True
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail='Admin authentication required',
+        headers={'WWW-Authenticate': 'Basic realm="AEO Auditor"'},
+    )
+
+
 @app.middleware('http')
 async def request_logging_middleware(request, call_next):
     """Log slow or non-2xx HTTP responses. Skips the normal 2xx/<1s noise
@@ -631,11 +658,22 @@ INDEX_HTML = r"""<!doctype html>
   .lib-count { color:var(--muted-2); font-size:12px; }
   .lib-grid { display:grid; gap:12px;
     grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); }
-  .lib-card { display:block; background:var(--panel); border:1px solid var(--border);
-    border-radius:11px; padding:16px 18px; text-decoration:none; color:inherit;
-    transition:border-color 0.15s, transform 0.1s, background 0.15s; }
+  .lib-card { position:relative; display:block; background:var(--panel);
+    border:1px solid var(--border); border-radius:11px; padding:16px 18px;
+    color:inherit; transition:border-color 0.15s, transform 0.1s, background 0.15s; }
   .lib-card:hover { border-color:var(--accent); transform:translateY(-2px);
-    background:var(--panel-2); text-decoration:none; }
+    background:var(--panel-2); }
+  /* Whole-card overlay link (sits under the delete button). */
+  .lib-link { position:absolute; inset:0; z-index:1; border-radius:11px;
+    text-decoration:none; }
+  .lib-del { position:absolute; top:8px; right:8px; z-index:2; width:24px;
+    height:24px; padding:0; border:1px solid var(--border); border-radius:6px;
+    background:var(--panel-2); color:var(--muted-2); font-size:13px;
+    line-height:1; cursor:pointer; opacity:0.4; transition:opacity 0.12s,
+    background 0.12s, color 0.12s; }
+  .lib-card:hover .lib-del, .lib-del:focus { opacity:1; }
+  .lib-del:hover { background:var(--bad-bg); color:var(--bad);
+    border-color:var(--bad); }
   .lib-domain { font-weight:600; font-size:14.5px; color:var(--fg);
     word-break:break-all; line-height:1.35; }
   .lib-sub { color:var(--muted); font-size:12px; margin-top:3px; }
@@ -1235,8 +1273,15 @@ function renderLibrary(audits) {
     const grade = (a.overall_grade || '').charAt(0).toUpperCase();
     const date = (a.created_at || a.audit_date || '').slice(0, 10);
     const meta = [a.page_type, a.industry].filter(Boolean).join(' · ');
+    const domAttr = encodeURIComponent(a.domain || '');
     cards +=
-      '<a class="lib-card" href="/' + encodeURIComponent(a.domain || '') + '">' +
+      '<div class="lib-card">' +
+        '<a class="lib-link" href="/' + domAttr +
+          '" aria-label="Open ' + escapeHtml(a.domain || '') + '"></a>' +
+        '<button class="lib-del" title="Delete this audit" ' +
+          'data-id="' + escapeHtml(a.audit_id || '') + '" ' +
+          'data-domain="' + escapeHtml(a.domain || '') + '" ' +
+          'onclick="deleteAuditCard(event, this)">✕</button>' +
         '<div class="lib-domain">' + escapeHtml(a.domain || a.url || '—') + '</div>' +
         (meta ? '<div class="lib-sub">' + escapeHtml(meta) + '</div>' : '') +
         '<div class="lib-row">' +
@@ -1248,13 +1293,53 @@ function renderLibrary(audits) {
             escapeHtml(date) +
           '</span>' +
         '</div>' +
-      '</a>';
+      '</div>';
   }
   lib.innerHTML =
     '<div class="lib-head"><h2>Recent audits</h2>' +
     '<span class="lib-count">' + audits.length + ' audit' +
     (audits.length === 1 ? '' : 's') + '</span></div>' +
     '<div class="lib-grid">' + cards + '</div>';
+}
+
+async function deleteAuditCard(ev, btn) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const auditId = btn.getAttribute('data-id') || '';
+  const domain = btn.getAttribute('data-domain') || 'this domain';
+  if (!auditId) { alert('No audit id on this card.'); return; }
+  const blockToo = confirm(
+    'Delete this audit for ' + domain + '?\\n\\n' +
+    'OK = delete just this audit.\\n' +
+    'Cancel = stop (nothing is deleted).'
+  );
+  if (!blockToo) return;
+  const alsoBlock = confirm(
+    'Also BLOCK ' + domain + ' from being re-audited or re-published?\\n\\n' +
+    'OK = delete ALL audits for ' + domain + ' and block it (use for takedown requests).\\n' +
+    'Cancel = delete only this one audit.'
+  );
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const url = alsoBlock
+      ? '/api/audit/by-domain/' + encodeURIComponent(domain) + '?suppress=1'
+      : '/api/audit/' + encodeURIComponent(auditId);
+    const r = await fetch(url, { method: 'DELETE', credentials: 'same-origin' });
+    if (r.status === 200) {
+      loadLibrary();
+    } else if (r.status === 401) {
+      alert('Not authorized to delete. Refresh and sign in again.');
+      btn.disabled = false; btn.textContent = '✕';
+    } else {
+      const t = await r.text();
+      alert('Delete failed (' + r.status + '): ' + t.slice(0, 200));
+      btn.disabled = false; btn.textContent = '✕';
+    }
+  } catch (e) {
+    alert('Delete error: ' + e.message);
+    btn.disabled = false; btn.textContent = '✕';
+  }
 }
 
 (function init() {
@@ -2131,24 +2216,15 @@ def api_audit_result(audit_id: str, request: Request,
 # ----------------------------------------------------------------------
 
 
-def _require_delete_auth():
-    """Destructive ops require the API key. In production a missing key
-    disables them entirely rather than leaving them open."""
-    if IS_PRODUCTION and not API_KEY_ENABLED:
-        raise HTTPException(status_code=503,
-                            detail='API key not configured; delete disabled')
-
-
 @app.delete('/api/audit/by-domain/{domain:path}')
 def delete_audit_by_domain(domain: str, suppress: int = 1,
-                           _: bool = Depends(require_api_key)):
+                           _: bool = Depends(require_admin)):
     """Delete ALL persisted audits for a domain (Supabase + disk + memory).
 
     suppress=1 (default) also adds the domain to the in-process denylist so it
     can't be re-audited/re-published until restart. For a durable block, add
     the bare domain to the SUPPRESSED_DOMAINS env var on the host.
     """
-    _require_delete_auth()
     reg = _registrable(domain)
     if not reg or '.' not in reg:
         raise HTTPException(status_code=400, detail='invalid domain')
@@ -2177,10 +2253,9 @@ def delete_audit_by_domain(domain: str, suppress: int = 1,
 
 
 @app.delete('/api/audit/{audit_id}')
-def delete_audit_by_id(audit_id: str, _: bool = Depends(require_api_key)):
+def delete_audit_by_id(audit_id: str, _: bool = Depends(require_admin)):
     """Delete a single audit by id (Supabase + disk + memory). Does not
     suppress the domain — use the by-domain route for that."""
-    _require_delete_auth()
     db_result = delete_audits(audit_id=audit_id)
     files_removed = _purge_local_artifacts(audit_id=audit_id)
     jobs_removed = _purge_jobs(audit_id=audit_id)
@@ -2191,17 +2266,16 @@ def delete_audit_by_id(audit_id: str, _: bool = Depends(require_api_key)):
 
 
 @app.get('/api/suppressed')
-def list_suppressed(_: bool = Depends(require_api_key)):
+def list_suppressed(_: bool = Depends(require_admin)):
     """List domains currently suppressed (env + in-process additions)."""
     with SUPPRESS_LOCK:
         return {'suppressed_domains': sorted(SUPPRESSED_DOMAINS)}
 
 
 @app.delete('/api/suppressed/{domain:path}')
-def unsuppress(domain: str, _: bool = Depends(require_api_key)):
+def unsuppress(domain: str, _: bool = Depends(require_admin)):
     """Remove a domain from the in-process denylist (does not affect the
     SUPPRESSED_DOMAINS env var — edit that on the host for a durable change)."""
-    _require_delete_auth()
     reg = _registrable(domain)
     with SUPPRESS_LOCK:
         SUPPRESSED_DOMAINS.discard(reg)
