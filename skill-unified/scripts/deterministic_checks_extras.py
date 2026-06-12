@@ -99,12 +99,16 @@ def detect_hreflang(html: str) -> Dict:
     # lowercase "hreflang" keys. The JSON quoted-key syntax cannot appear
     # inside a <link> tag (attributes are hreflang="..."), so the streamed
     # count stays distinct from the top-level count.
+    # Only count streamed hits on pages that actually carry Next.js payloads
+    # — any inline JS config with an "hreflang" key would otherwise flip a
+    # monolingual site from 'na' to a false warn.
     streamed_langs: Set[str] = set()
-    for m in re.finditer(
-        r'\\*"hreflang\\*"\s*:\s*\\*"([a-zA-Z\-]+)\\*"',
-        html, re.IGNORECASE
-    ):
-        streamed_langs.add(m.group(1).lower())
+    if 'self.__next_f' in html or '__NEXT_DATA__' in html:
+        for m in re.finditer(
+            r'\\*"hreflang\\*"\s*:\s*\\*"([a-zA-Z\-]+)\\*"',
+            html, re.IGNORECASE
+        ):
+            streamed_langs.add(m.group(1).lower())
 
     total_langs = toplevel_langs | streamed_langs
     total_count = len(total_langs)

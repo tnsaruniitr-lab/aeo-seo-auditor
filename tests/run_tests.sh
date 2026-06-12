@@ -395,6 +395,72 @@ assert_contains "schema questions extracted + matched in visible text" "$OUT" "Q
 assert_contains "German question word detected"     "$OUT" "DE=True"
 
 # ----------------------------------------------------------------------
+# TEST 12: 404-probe redirected to homepage must NOT classify spa_no_ssr
+# ----------------------------------------------------------------------
+# Regression for the -L follow-up bug: sites that 301 unknown paths to /
+# hand the analyzer the homepage twice; that is a soft-404 config, not an
+# SPA shell.
+echo ""
+echo "[12] 404-redirects-to-home — soft_404_redirect, not spa_no_ssr"
+OUT=$(python3 - "$UNI_DIR" <<'PYEOF'
+import importlib.util, json, sys, tempfile, os
+uni = sys.argv[1]
+spec = importlib.util.spec_from_file_location('bev', os.path.join(uni, '_bev_analyze.py'))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+home = '<html><body><h1>Acme Plumbing Berlin</h1>' + '<p>real content word soup</p>' * 200 + '</body></html>'
+with tempfile.TemporaryDirectory() as td:
+    fp = os.path.join(td, 'page.html')
+    with open(fp, 'w') as f:
+        f.write(home)
+    probes = {}
+    for name in ('default', 'gbot', 'gpt', 'perp', 'claude'):
+        probes[name] = {'html_file': fp, 'curl_result': '200 9000 0.05 0 https://acme.example/'}
+    # 404 probe: REDIRECTED (1 hop) to the same final URL, same body
+    probes['not_found'] = {'html_file': fp, 'curl_result': '200 9000 0.05 1 https://acme.example/'}
+    r = m._run_cli({'url': 'https://acme.example/', 'probe_url': 'https://acme.example/nope', 'probes': probes})
+print('CLASS=' + r['classification'])
+print('SOFT404=' + str(r['soft_404_redirect']))
+print('SAME404=' + str(r['same_as_404']))
+PYEOF
+)
+assert_contains "redirect-to-home classifies by content, not spa_no_ssr" "$OUT" "CLASS=fully_accessible"
+assert_contains "soft_404_redirect flagged" "$OUT" "SOFT404=True"
+assert_contains "same_as_404 suppressed" "$OUT" "SAME404=False"
+
+# ----------------------------------------------------------------------
+# TEST 13: visible FAQ + no FAQPage schema → schema_missing, no critical
+# ----------------------------------------------------------------------
+echo ""
+echo "[13] visible FAQ without schema — opportunity, not a critical mismatch"
+OUT=$(python3 - "$UNI_DIR" <<'PYEOF'
+import importlib.util, json, sys, tempfile, os
+uni = sys.argv[1]
+spec = importlib.util.spec_from_file_location('bev', os.path.join(uni, '_bev_analyze.py'))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+page = ('<html><body><h1>Help</h1>'
+        + '<details><summary>How does billing work?</summary><p>Monthly.</p></details>'
+        + '<details><summary>Can I cancel anytime?</summary><p>Yes.</p></details>'
+        + '<p>filler words</p>' * 150 + '</body></html>')
+with tempfile.TemporaryDirectory() as td:
+    fp = os.path.join(td, 'page.html')
+    nf = os.path.join(td, 'nf.html')
+    with open(fp, 'w') as f:
+        f.write(page)
+    with open(nf, 'w') as f:
+        f.write('<html><body>not found</body></html>')
+    probes = {n: {'html_file': fp, 'curl_result': '200 9000 0.05 0 https://x.example/'}
+              for n in ('default', 'gbot', 'gpt', 'perp', 'claude')}
+    probes['not_found'] = {'html_file': nf, 'curl_result': '404 30 0.05 0 https://x.example/nope'}
+    r = m._run_cli({'url': 'https://x.example/', 'probe_url': 'https://x.example/nope', 'probes': probes})
+s = r['summary']
+print('INTEGRITY=' + s['faq_integrity'])
+print('FAQ_CRITICAL=' + str(any('FAQ schema/HTML mismatch' in c for c in s['critical_issues'])))
+PYEOF
+)
+assert_contains "integrity is schema_missing" "$OUT" "INTEGRITY=schema_missing"
+assert_contains "no FAQ mismatch critical emitted" "$OUT" "FAQ_CRITICAL=False"
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 echo ""

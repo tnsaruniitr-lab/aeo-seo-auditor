@@ -26,6 +26,7 @@ Dependencies: curl, python3 (3.8+). stdlib only.
 """
 
 import gzip
+import zlib
 import hashlib
 import json
 import re
@@ -78,8 +79,8 @@ def curl_fetch(url: str, timeout: int = CURL_TIMEOUT) -> Tuple[int, str, str]:
         if body_bytes[:2] == b'\x1f\x8b' or url.lower().split('?')[0].endswith('.gz'):
             try:
                 body_bytes = gzip.decompress(body_bytes)
-            except OSError:
-                pass  # not actually gzipped — keep the raw bytes
+            except (OSError, EOFError, zlib.error):
+                pass  # not gzipped / truncated download — keep the raw bytes
         body = body_bytes.decode('utf-8', errors='replace')
         stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
         return code, body, stderr

@@ -386,7 +386,11 @@ def check_j2_brand_name_consistency(html, brand_name=None):
                 continue
             items = data if isinstance(data, list) else [data]
             for item in items:
-                if isinstance(item, dict) and item.get('@type') in ('Organization', 'MedicalBusiness', 'LocalBusiness', 'SoftwareApplication'):
+                _t = item.get('@type') if isinstance(item, dict) else None
+                _types = _t if isinstance(_t, list) else [_t]
+                if isinstance(item, dict) and any(
+                        x in ('Organization', 'MedicalBusiness', 'LocalBusiness', 'SoftwareApplication')
+                        for x in _types if isinstance(x, str)):
                     n = item.get('name')
                     # name can be a non-string JSON-LD value like
                     # {"@value": "Acme"} — only strings are usable here
@@ -914,8 +918,11 @@ def check_a2b_title_uniqueness(url, sample_size=3):
             'detail': {'titles': titles_collected, 'statuses': statuses}
         }
 
-    # If every tested URL returns the same title → shared shell pattern
-    if len(unique_titles) == 1 and all(titles_collected.values()):
+    # If every tested URL returns the same title → shared shell pattern.
+    # Compare on REAL-page titles only: the 404 probe may legitimately lack
+    # a title, and its absence must not suppress this detection.
+    real_titles = [t for u, t in titles_collected.items() if u != ne_url and t]
+    if len(unique_titles) == 1 and len(real_titles) >= 2:
         shared = list(unique_titles)[0]
         if probe_2xx:
             # Main URL is 2xx (checked above), so the SPA-shell claim is safe

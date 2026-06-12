@@ -384,20 +384,30 @@ def parse_curl_result(result_str: str) -> Dict:
     parts = result_str.strip().split()
     out = {'http_code': 0, 'size_bytes': 0, 'ttfb_seconds': 0.0,
            'num_redirects': 0, 'final_url': ''}
-    try:
-        if len(parts) > 0:
-            out['http_code'] = int(parts[0])
-        if len(parts) > 1:
-            out['size_bytes'] = int(parts[1])
-        if len(parts) > 2:
-            out['ttfb_seconds'] = float(parts[2])
-        if len(parts) > 3:
-            out['num_redirects'] = int(parts[3])
-        if len(parts) > 4 and parts[4] != '-':
-            out['final_url'] = parts[4]
-    except (ValueError, IndexError):
-        return {'http_code': 0, 'size_bytes': 0, 'ttfb_seconds': 0.0,
-                'num_redirects': 0, 'final_url': ''}
+
+    # Per-field guards: one malformed field must not reset the others
+    # (e.g. a valid http_code followed by garbage would otherwise read as
+    # a spurious fetch_failed).
+    def _int_at(idx):
+        try:
+            return int(parts[idx])
+        except (ValueError, IndexError):
+            return 0
+
+    def _float_at(idx):
+        try:
+            return float(parts[idx])
+        except (ValueError, IndexError):
+            return 0.0
+
+    out['http_code'] = _int_at(0)
+    out['size_bytes'] = _int_at(1)
+    out['ttfb_seconds'] = _float_at(2)
+    out['num_redirects'] = _int_at(3)
+    if len(parts) > 4 and parts[4] != '-':
+        # Join the tail: a malformed Location header can put a literal
+        # space into url_effective.
+        out['final_url'] = ' '.join(parts[4:])
     return out
 
 
@@ -495,9 +505,21 @@ def _run_cli(payload: Dict) -> Dict:
     default_html = html_by_probe.get('default', '')
     nf_html = html_by_probe.get('not_found', '')
 
+    # If the guaranteed-404 probe was REDIRECTED to the same final URL as
+    # the default probe (unknown paths → homepage, a very common server
+    # config), both bodies are the homepage. That's a soft-404 setup, NOT
+    # an SPA shell — comparing the bodies would false-positive spa_no_ssr.
+    nf_probe = per_probe.get('not_found', {})
+    d0 = per_probe.get('default', {})
+    soft_404_redirect = bool(
+        nf_probe.get('redirects_followed', 0) > 0
+        and nf_probe.get('final_url')
+        and nf_probe.get('final_url') == d0.get('final_url')
+    )
+
     # same-as-404: default page body indistinguishable from a guaranteed 404.
     same_as_404 = False
-    if default_html and nf_html:
+    if not soft_404_redirect and default_html and nf_html:
         same_as_404 = (
             _normalize_for_equality(default_html) == _normalize_for_equality(nf_html)
             or (
@@ -558,6 +580,10 @@ def _run_cli(payload: Dict) -> Dict:
     schema_q_visible = d.get('faq_schema_questions_visible', 0)
     if visible_faq == 0 and schema_faq == 0:
         faq_integrity = 'na'
+    elif schema_faq == 0 and visible_faq > 0:
+        # Visible FAQ widget but no FAQPage JSON-LD — a markup opportunity,
+        # not an integrity failure (and never a critical issue).
+        faq_integrity = 'schema_missing'
     elif visible_faq == schema_faq:
         faq_integrity = 'ok'
     elif schema_faq > 0 and schema_q_visible >= schema_faq:
@@ -592,6 +618,17 @@ def _run_cli(payload: Dict) -> Dict:
     if bot_blocking:
         blocked = ', '.join(f"{b['probe']}={b['http_code']}" for b in bot_blocking)
         critical_issues.append(f'AI-bot user agents blocked while browser UA succeeds: {blocked}')
+    # Reverse case: browser-profile UA failed but bot UAs fetched fine. The
+    # classification reflects the default probe, so say explicitly that the
+    # page IS reachable to those crawlers — otherwise "denies non-browser
+    # clients" reads as the opposite of what happened.
+    bots_ok = [n for n in ('gbot', 'gpt', 'perp', 'claude')
+               if 200 <= per_probe.get(n, {}).get('http_code', 0) < 300]
+    if not default_ok and bots_ok:
+        critical_issues.append(
+            'Note: bot UAs (' + ', '.join(bots_ok) + ') fetched the page '
+            'successfully (2xx) while the browser-profile UA did not — '
+            'classification reflects the browser probe; see probes.* for the bot view')
     if cloaking_detected:
         critical_issues.append('Cloaking suspected: bot UAs receive significantly different content')
     if faq_integrity in ('mismatch', 'partial_text_match'):
@@ -604,6 +641,7 @@ def _run_cli(payload: Dict) -> Dict:
         'probe_url': probe_url,
         'probes': per_probe,
         'same_as_404': same_as_404,
+        'soft_404_redirect': soft_404_redirect,
         'cloaking_detected': cloaking_detected,
         'cloaking_deltas': cloaking_deltas,
         'bot_blocking_detected': bool(bot_blocking),
@@ -623,6 +661,7 @@ def _run_cli(payload: Dict) -> Dict:
             # Key names the orchestrator's human mode reads — previously it
             # looked these up in summary and always got None.
             'same_html_as_404_url': same_as_404,
+            'soft_404_redirect': soft_404_redirect,
             'cloaking_detected': cloaking_detected,
             'bot_blocking_detected': bool(bot_blocking),
             'critical_issues': critical_issues,

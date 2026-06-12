@@ -231,21 +231,28 @@ and `$TARGET_URL` is the audited URL.
   page (it is a redirect stub, error page, or nothing). Write ZERO content findings
   (no word counts, no "SPA", no FAQ claims) — report the transport problem itself and,
   for `unresolved_redirect`, re-run against `summary.final_url`. `bot_blocked` (401/403/429
-  on the default UA) IS a reportable finding: the site denies non-browser clients.
+  on the default UA) means the BROWSER-PROFILE probe was denied — check `critical_issues`
+  and `bot_blocking`: if bot UAs returned 2xx, the page IS reachable to crawlers, so report
+  the browser-side block, never "invisible to AI".
 - `summary.http_code_default`, `summary.final_url`, `summary.redirects_followed` — probes
   follow up to 5 redirects like real crawlers; final URL ≠ input URL is normal (http→https)
 - `summary.same_html_as_404_url` — **CRITICAL BOOLEAN** — if true, the site is a SPA without SSR
+- `summary.soft_404_redirect` — the 404-probe was redirected to the same final URL as the
+  page (unknown paths → homepage). A soft-404 config finding, NOT an SPA signal — when true,
+  the SPA comparison was skipped on purpose
 - `summary.cloaking_detected` — bot UAs receive significantly different content (only
   compared between successful 2xx probes)
 - `summary.bot_blocking_detected` + top-level `bot_blocking` — AI-bot UAs get 4xx while the
   browser UA gets 2xx. This is access denial, NOT cloaking and NOT thin content.
 - `summary.visible_words_default`, `summary.spa_signals`
 - `summary.faq_visible` / `faq_schema` / `faq_schema_questions_visible` / `faq_integrity`
-  (`na` | `ok` | `ok_text_match` | `partial_text_match` | `mismatch`) — `ok_text_match` means
-  every schema question's text IS present in the visible HTML even though no FAQ widget
-  pattern matched (Framer/custom markup). Do NOT report "FAQ markup disqualified" unless
-  integrity is `mismatch` or `partial_text_match`, and then quote
-  `faq_schema_questions_visible` of `faq_schema` as the evidence.
+  (`na` | `ok` | `ok_text_match` | `partial_text_match` | `mismatch` | `schema_missing`) —
+  `ok_text_match` means every schema question's text IS present in the visible HTML even
+  though no FAQ widget pattern matched (Framer/custom markup). `schema_missing` means a
+  visible FAQ exists with no FAQPage JSON-LD: recommend ADDING markup; it is not an
+  integrity failure. Do NOT report "FAQ markup disqualified" unless integrity is
+  `mismatch` or `partial_text_match`, and then quote `faq_schema_questions_visible` of
+  `faq_schema` as the evidence.
 - `summary.critical_issues` — quote these verbatim; an empty array means none
 - `probes.{default,gbot,gpt,perp,claude,not_found}` — per-UA: `http_code`, `size_bytes`,
   `ttfb_seconds`, `redirects_followed`, `final_url`, `visible_words`, `faq_visible`,

@@ -23,8 +23,9 @@ fi
 URL="$1"
 
 # Default to https:// when no scheme is given, so curl doesn't misread the
-# input and the ORIGIN parse below always matches.
-case "$URL" in
+# input and the ORIGIN parse below always matches. Scheme match is
+# case-insensitive (HTTP://x.com must not become https://HTTP://x.com).
+case "$(printf '%s' "$URL" | tr '[:upper:]' '[:lower:]')" in
   http://*|https://*) ;;
   *) URL="https://${URL}" ;;
 esac
@@ -61,7 +62,12 @@ fetch() {
     -w "%{http_code} %{size_download} %{time_starttransfer} %{num_redirects} %{url_effective}" \
     -H "User-Agent: $ua" \
     -H "Cache-Control: no-cache" \
-    "$url" 2>/dev/null) || res="000 0 0 0 -"
+    "$url" 2>/dev/null) || true
+  # curl writes the -w line even when it fails mid-transfer — a redirect
+  # loop exits 47 but still reports '301 ... 5 <url>', which the analyzer
+  # turns into 'unresolved_redirect'. Only synthesize the failure sentinel
+  # when curl wrote nothing at all (DNS failure, no connection).
+  [ -n "$res" ] || res="000 0 0 0 -"
   printf '%s\n' "$res"
 }
 

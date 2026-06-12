@@ -35,8 +35,9 @@ fi
 URL="$1"
 
 # Default to https:// when no scheme is given — children derive the origin
-# from this URL and a scheme-less input breaks every one of them.
-case "$URL" in
+# from this URL and a scheme-less input breaks every one of them. Scheme
+# match is case-insensitive (HTTP://x.com must not get a second scheme).
+case "$(printf '%s' "$URL" | tr '[:upper:]' '[:lower:]')" in
   http://*|https://*) ;;
   *) URL="https://${URL}" ;;
 esac
