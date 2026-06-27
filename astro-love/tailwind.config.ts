@@ -1,23 +1,24 @@
 import type { Config } from "tailwindcss";
 
+// Colors are CSS variables (RGB channel triples) set per theme in globals.css,
+// so every `text-cream` / `bg-gold/20` etc. re-themes automatically.
+const v = (name: string) => `rgb(var(--c-${name}) / <alpha-value>)`;
+
 const config: Config = {
-  content: [
-    "./app/**/*.{ts,tsx}",
-    "./components/**/*.{ts,tsx}",
-  ],
+  content: ["./app/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
-        ink: "#070612",
-        cosmos: "#0c0a1d",
-        panel: "#15122b",
-        gold: "#e8c887",
-        goldbright: "#f4e0b0",
-        rose: "#dd8fa6",
-        teal: "#74b2c4",
-        lilac: "#b9a7e6",
-        haze: "#a79fc4",
-        cream: "#efe9f6",
+        ink: v("ink"),
+        cosmos: v("cosmos"),
+        panel: v("panel"),
+        gold: v("gold"),
+        goldbright: v("goldbright"),
+        rose: v("rose"),
+        teal: v("teal"),
+        lilac: v("lilac"),
+        haze: v("haze"),
+        cream: v("cream"),
       },
       fontFamily: {
         display: ['"Cormorant Garamond"', "Georgia", '"Times New Roman"', "serif"],

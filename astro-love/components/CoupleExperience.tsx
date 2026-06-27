@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import BirthFields, { type BirthFormValues } from "./BirthFields";
 import SynastryWheel from "./SynastryWheel";
+import ThemeSwitcher from "./ThemeSwitcher";
+import { useTheme } from "./ThemeProvider";
 import { BODIES } from "@/lib/astro/zodiac";
 import type { ChartFacts } from "@/lib/astro/types";
 import type { SynastryResult, SynAspect } from "@/lib/astro/synastry";
@@ -20,9 +22,6 @@ export interface CoupleResult {
 const ASPECT_GLYPH: Record<string, string> = {
   conjunction: "☌", sextile: "⚹", square: "□", trine: "△", quincunx: "⚻", opposition: "☍",
 };
-const VALENCE_COLOR: Record<string, string> = {
-  harmonious: "#74b2c4", tension: "#dd8fa6", blending: "#e8c887",
-};
 
 export default function CoupleExperience({
   initialA,
@@ -33,6 +32,7 @@ export default function CoupleExperience({
   initialB: BirthFormValues;
   initialResult: CoupleResult;
 }) {
+  const { palette: pal } = useTheme();
   const [a, setA] = useState(initialA);
   const [b, setB] = useState(initialB);
   const [result, setResult] = useState<CoupleResult>(initialResult);
@@ -58,11 +58,12 @@ export default function CoupleExperience({
   }
 
   return (
-    <main className="relative mx-auto max-w-6xl px-4 sm:px-6 py-10 sm:py-14">
-      <nav className="flex justify-center mb-8">
+    <main className="relative mx-auto max-w-6xl px-4 sm:px-6 py-8 sm:py-12">
+      <nav className="flex items-center justify-between mb-8">
         <Link href="/" className="text-xs uppercase tracking-[0.2em] text-haze hover:text-gold transition-colors">
           ← Single natal chart
         </Link>
+        <ThemeSwitcher />
       </nav>
 
       <header className="text-center">
@@ -80,12 +81,11 @@ export default function CoupleExperience({
         </p>
       </header>
 
-      {/* Two birth panels */}
       <div className="grid md:grid-cols-2 gap-5 mt-10">
-        <Panel label="Person A" accent="#f4e0b0">
+        <Panel label="Person A" accent={pal.personA}>
           <BirthFields value={a} onChange={setA} namePlaceholder="e.g. Anna" />
         </Panel>
-        <Panel label="Person B" accent="#c9b6f2">
+        <Panel label="Person B" accent={pal.personB}>
           <BirthFields value={b} onChange={setB} namePlaceholder="e.g. Dmitri" />
         </Panel>
       </div>
@@ -119,15 +119,15 @@ function Panel({ label, accent, children }: { label: string; accent: string; chi
 }
 
 function Result({ result }: { result: CoupleResult }) {
+  const { palette: pal } = useTheme();
   const { a, b, syn } = result;
   return (
     <section className="mt-10 space-y-6">
-      {/* Score hero */}
       <div className="glass p-6 sm:p-8 text-center fade-up">
         <div className="text-sm text-haze tracking-wide">
-          <span style={{ color: "#f4e0b0" }}>{syn.names.a}</span>
+          <span style={{ color: pal.personA }}>{syn.names.a}</span>
           <span className="mx-2 text-gold">✦</span>
-          <span style={{ color: "#c9b6f2" }}>{syn.names.b}</span>
+          <span style={{ color: pal.personB }}>{syn.names.b}</span>
         </div>
         <div className="flex flex-col items-center mt-3">
           <ScoreGauge score={syn.score} />
@@ -136,30 +136,28 @@ function Result({ result }: { result: CoupleResult }) {
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-7 max-w-3xl mx-auto">
-          <SubBar label="Emotional" value={syn.subscores.emotional} color="#6fa8c7" />
-          <SubBar label="Attraction" value={syn.subscores.attraction} color="#dd8fa6" />
-          <SubBar label="Affection" value={syn.subscores.affection} color="#e0a96b" />
-          <SubBar label="Communication" value={syn.subscores.communication} color="#d8c36b" />
-          <SubBar label="Commitment" value={syn.subscores.commitment} color="#9db07a" />
+          <SubBar label="Emotional" value={syn.subscores.emotional} color={pal.sub.emotional} />
+          <SubBar label="Attraction" value={syn.subscores.attraction} color={pal.sub.attraction} />
+          <SubBar label="Affection" value={syn.subscores.affection} color={pal.sub.affection} />
+          <SubBar label="Communication" value={syn.subscores.communication} color={pal.sub.communication} />
+          <SubBar label="Commitment" value={syn.subscores.commitment} color={pal.sub.commitment} />
         </div>
       </div>
 
       <div className="grid lg:grid-cols-5 gap-6">
-        {/* Bi-wheel */}
         <div className="lg:col-span-3 glass p-5 sm:p-6 fade-up">
           <div className="aspect-square max-w-[560px] mx-auto">
             <SynastryWheel chartA={a} chartB={b} syn={syn} />
           </div>
           <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-1.5 mt-3 text-[11px] text-haze">
-            <Legend c="#f4e0b0" t={`${syn.names.a} (inner)`} dot />
-            <Legend c="#c9b6f2" t={`${syn.names.b} (outer)`} dot />
-            <Legend c="#74b2c4" t="harmonious" />
-            <Legend c="#dd8fa6" t="challenging" />
-            <Legend c="#e8c887" t="conjunction" />
+            <Legend c={pal.personA} t={`${syn.names.a} (inner)`} dot />
+            <Legend c={pal.personB} t={`${syn.names.b} (outer)`} dot />
+            <Legend c={pal.aspect.harmonious} t="harmonious" />
+            <Legend c={pal.aspect.tension} t="challenging" />
+            <Legend c={pal.aspect.blending} t="conjunction" />
           </div>
         </div>
 
-        {/* Why this score */}
         <div className="lg:col-span-2 glass p-5 sm:p-6 fade-up">
           <h3 className="font-display text-xl text-cream">Why this score</h3>
           <p className="text-xs text-haze mt-1 mb-4">
@@ -199,17 +197,19 @@ function Result({ result }: { result: CoupleResult }) {
 }
 
 function AspectRow({ asp }: { asp: SynAspect }) {
+  const { palette: pal } = useTheme();
   const aMeta = BODIES.find((x) => x.key === asp.aBody);
   const bMeta = BODIES.find((x) => x.key === asp.bBody);
+  const vc = pal.aspect[asp.valence];
   return (
-    <li className="flex items-start gap-3 rounded-xl bg-white/[0.02] border border-white/5 px-3 py-2.5">
+    <li className="flex items-start gap-3 rounded-xl bg-cream/[0.03] border border-cream/10 px-3 py-2.5">
       <span className="mt-0.5 inline-flex items-center gap-1 shrink-0" style={{ fontFamily: GLYPH_FONT }}>
-        <span style={{ color: "#f4e0b0" }}>{aMeta?.glyph ?? "↑"}</span>
-        <span style={{ color: VALENCE_COLOR[asp.valence], fontSize: "0.85em" }}>{ASPECT_GLYPH[asp.aspect]}</span>
-        <span style={{ color: "#c9b6f2" }}>{bMeta?.glyph ?? "↑"}</span>
+        <span style={{ color: pal.personA }}>{aMeta?.glyph ?? "↑"}</span>
+        <span style={{ color: vc, fontSize: "0.85em" }}>{ASPECT_GLYPH[asp.aspect]}</span>
+        <span style={{ color: pal.personB }}>{bMeta?.glyph ?? "↑"}</span>
       </span>
       <span className="text-[13px] text-cream/85 leading-snug flex-1">{asp.sentence}</span>
-      <span className="text-xs tabular-nums shrink-0" style={{ color: VALENCE_COLOR[asp.valence] }}>+{asp.points.toFixed(1)}</span>
+      <span className="text-xs tabular-nums shrink-0" style={{ color: vc }}>+{asp.points.toFixed(1)}</span>
     </li>
   );
 }
@@ -226,7 +226,7 @@ function SubBar({ label, value, color }: { label: string; value: number; color: 
         <span className="text-[10px] uppercase tracking-wider text-haze/80">{label}</span>
         <span className="text-sm tabular-nums" style={{ color }}>{value}</span>
       </div>
-      <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+      <div className="h-1.5 rounded-full bg-cream/10 overflow-hidden">
         <div className="h-full rounded-full transition-[width] duration-1000 ease-out" style={{ width: `${w}%`, background: color }} />
       </div>
     </div>
@@ -243,6 +243,7 @@ function Legend({ c, t, dot }: { c: string; t: string; dot?: boolean }) {
 }
 
 function ScoreGauge({ score }: { score: number }) {
+  const { palette: pal } = useTheme();
   const r = 76;
   const circ = 2 * Math.PI * r;
   const [offset, setOffset] = useState(circ);
@@ -255,12 +256,12 @@ function ScoreGauge({ score }: { score: number }) {
       <svg viewBox="0 0 180 180" className="w-full h-full -rotate-90">
         <defs>
           <linearGradient id="gauge" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="#f4e0b0" />
-            <stop offset="55%" stopColor="#e8c887" />
-            <stop offset="100%" stopColor="#dd8fa6" />
+            <stop offset="0%" stopColor={pal.gauge.from} />
+            <stop offset="55%" stopColor={pal.gauge.mid} />
+            <stop offset="100%" stopColor={pal.gauge.to} />
           </linearGradient>
         </defs>
-        <circle cx="90" cy="90" r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="10" />
+        <circle cx="90" cy="90" r={r} fill="none" style={{ stroke: "rgb(var(--c-cream) / 0.12)" }} strokeWidth="10" />
         <circle
           cx="90" cy="90" r={r} fill="none" stroke="url(#gauge)" strokeWidth="10" strokeLinecap="round"
           strokeDasharray={circ} strokeDashoffset={offset}

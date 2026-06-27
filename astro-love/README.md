@@ -9,6 +9,7 @@ The differentiator: not vague sun-signs and not a black-box score — every comp
 A working **Next.js (App Router) PWA**:
 - **`/`** — enter birth date / time / place → a real, validated natal chart (planet positions, Ascendant, Midheaven, whole-sign houses) on an animated SVG wheel.
 - **`/compatibility`** — enter two people → a **0–100 compatibility score** with five sub-scores, a **synastry bi-wheel** (inner = Person A, outer = Person B, cross-chart aspect web), and a fully **explainable breakdown** where every point traces to a named, plain-English aspect ("Venus conjunct Mars +8.9") plus house overlays.
+- **Two themes**, switchable from a dropdown (persisted): **Cosmic Night** (deep, dark, starlit) and **Rose Aurora** (soft, warm, ambient — love-suited). Driven by CSS variables + a per-theme palette so every surface and both chart wheels re-theme; see `lib/theme.ts` and `components/ThemeProvider.tsx`.
 
 ### Run it
 ```bash

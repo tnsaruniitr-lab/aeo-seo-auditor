@@ -5,6 +5,8 @@ import Link from "next/link";
 import BirthForm, { type BirthFormValues } from "./BirthForm";
 import ChartWheel from "./ChartWheel";
 import PlanetTable from "./PlanetTable";
+import ThemeSwitcher from "./ThemeSwitcher";
+import { useTheme } from "./ThemeProvider";
 import { SIGNS, BODIES } from "@/lib/astro/zodiac";
 import type { ChartFacts } from "@/lib/astro/types";
 
@@ -41,7 +43,10 @@ export default function Experience({
   }
 
   return (
-    <main className="relative mx-auto max-w-6xl px-4 sm:px-6 py-10 sm:py-14">
+    <main className="relative mx-auto max-w-6xl px-4 sm:px-6 py-8 sm:py-12">
+      <div className="flex justify-end mb-4">
+        <ThemeSwitcher />
+      </div>
       <Header />
 
       <div className="grid lg:grid-cols-5 gap-6 lg:gap-8 mt-10">
@@ -143,7 +148,7 @@ function BigThree({ label, body, signKey }: { label: string; body: "Sun" | "Moon
       <div className="text-[10px] uppercase tracking-[0.2em] text-haze/80 flex items-center justify-center gap-1.5">
         <span style={{ fontFamily: GLYPH_FONT }} className="text-gold">{bodyGlyph}</span> {label}
       </div>
-      <div className="mt-2 text-3xl" style={{ fontFamily: GLYPH_FONT, color: "#f4e0b0" }}>
+      <div className="mt-2 text-3xl text-goldbright" style={{ fontFamily: GLYPH_FONT }}>
         {sign ? sign.glyph : "—"}
       </div>
       <div className="font-display text-lg text-cream mt-1">{sign ? sign.en : "Unknown"}</div>
@@ -153,10 +158,11 @@ function BigThree({ label, body, signKey }: { label: string; body: "Sun" | "Moon
 }
 
 function AspectLegend() {
+  const { palette: pal } = useTheme();
   const items = [
-    { c: "#74b2c4", t: "Harmonious — flow & ease" },
-    { c: "#dd8fa6", t: "Challenging — passion & growth" },
-    { c: "#e8c887", t: "Conjunction — blending" },
+    { c: pal.aspect.harmonious, t: "Harmonious — flow & ease" },
+    { c: pal.aspect.tension, t: "Challenging — passion & growth" },
+    { c: pal.aspect.blending, t: "Conjunction — blending" },
   ];
   return (
     <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-1.5 mt-4 text-[11px] text-haze">

@@ -1,12 +1,14 @@
 "use client";
 
-import { BODIES, SIGNS, formatLon, ELEMENT_COLOR } from "@/lib/astro/zodiac";
+import { BODIES, SIGNS, formatLon } from "@/lib/astro/zodiac";
+import { useTheme } from "./ThemeProvider";
 import type { ChartFacts } from "@/lib/astro/types";
 
 const GLYPH_FONT =
   '"Noto Sans Symbols2","Segoe UI Symbol","Apple Symbols","DejaVu Sans",serif';
 
 export default function PlanetTable({ chart }: { chart: ChartFacts }) {
+  const { palette: pal } = useTheme();
   return (
     <div className="fade-up">
       {chart.asc && chart.mc && (
@@ -41,7 +43,7 @@ export default function PlanetTable({ chart }: { chart: ChartFacts }) {
                   </td>
                   <td className="py-2.5">
                     <span className="inline-flex items-center gap-2">
-                      <span style={{ color: ELEMENT_COLOR[sign.element], fontFamily: GLYPH_FONT }}>{sign.glyph}</span>
+                      <span style={{ color: pal.element[sign.element], fontFamily: GLYPH_FONT }}>{sign.glyph}</span>
                       <span className="text-cream/90 tabular-nums">{formatLon(p.lon)}</span>
                       {p.retrograde && <span className="text-rose text-xs">℞</span>}
                     </span>

@@ -2,41 +2,113 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
+/* ───────────────────────── theme tokens ───────────────────────── */
+:root,
+[data-theme="night"] {
   color-scheme: dark;
-}
+  --c-ink: 7 6 18;
+  --c-cosmos: 12 10 29;
+  --c-panel: 21 18 43;
+  --c-gold: 232 200 135;
+  --c-goldbright: 244 224 176;
+  --c-rose: 221 143 166;
+  --c-teal: 116 178 196;
+  --c-lilac: 185 167 230;
+  --c-haze: 167 159 196;
+  --c-cream: 239 233 246;
 
-html,
-body {
-  background: #070612;
-  color: #efe9f6;
-  font-family: var(--font-body, "Inter", system-ui, sans-serif);
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-}
-
-/* ---- Cosmic backdrop --------------------------------------------------- */
-.cosmos-bg {
-  position: fixed;
-  inset: 0;
-  z-index: -2;
-  background:
+  --page-bg: #070612;
+  --cosmos-bg:
     radial-gradient(1100px 800px at 78% -10%, rgba(120, 86, 200, 0.30), transparent 60%),
     radial-gradient(900px 700px at 12% 18%, rgba(196, 142, 170, 0.16), transparent 55%),
     radial-gradient(1200px 900px at 50% 120%, rgba(72, 120, 150, 0.18), transparent 60%),
     linear-gradient(180deg, #08071a 0%, #0a0820 45%, #070612 100%);
+  --star-opacity: 0.55;
+  --aurora-opacity: 0;
+
+  --glass-bg: linear-gradient(180deg, rgba(33, 27, 64, 0.62), rgba(18, 15, 38, 0.55));
+  --glass-border: rgba(232, 200, 135, 0.16);
+  --glass-shadow: 0 24px 70px -30px rgba(0, 0, 0, 0.85), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --glass-blur: 14px;
+
+  --field-bg: rgba(10, 8, 26, 0.6);
+  --field-border: rgba(232, 200, 135, 0.18);
+  --field-focus: rgba(232, 200, 135, 0.55);
+  --field-focus-ring: rgba(232, 200, 135, 0.12);
+
+  --btn-grad: linear-gradient(180deg, #f4e0b0, #e2bd76);
+  --btn-text: #2b2206;
+  --btn-shadow: 0 12px 30px -12px rgba(232, 200, 135, 0.6);
+
+  --gold-grad: linear-gradient(180deg, #f7e8c4 0%, #e8c887 55%, #c9a45f 100%);
+  --hairline: rgba(232, 200, 135, 0.14);
 }
 
-.starfield,
-.starfield::before,
-.starfield::after {
+[data-theme="dawn"] {
+  color-scheme: light;
+  --c-ink: 251 242 238;
+  --c-cosmos: 253 246 241;
+  --c-panel: 255 255 255;
+  --c-gold: 185 126 116; /* soft rose-gold */
+  --c-goldbright: 175 96 92; /* rich rose-gold for headings/numbers */
+  --c-rose: 196 84 112;
+  --c-teal: 79 134 147;
+  --c-lilac: 138 112 184;
+  --c-haze: 150 116 130; /* muted mauve */
+  --c-cream: 74 46 58; /* deep rosewood = primary text */
+
+  --page-bg: #fbf2ee;
+  --cosmos-bg:
+    radial-gradient(1100px 820px at 82% -12%, rgba(255, 190, 200, 0.55), transparent 60%),
+    radial-gradient(950px 720px at 6% 16%, rgba(255, 214, 178, 0.5), transparent 58%),
+    radial-gradient(1050px 940px at 50% 116%, rgba(214, 196, 240, 0.5), transparent 62%),
+    radial-gradient(760px 640px at 96% 72%, rgba(255, 203, 220, 0.45), transparent 60%),
+    linear-gradient(180deg, #fdf5f1 0%, #fbeef0 50%, #fdf3ee 100%);
+  --star-opacity: 0;
+  --aurora-opacity: 1;
+
+  --glass-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(255, 250, 248, 0.62));
+  --glass-border: rgba(183, 110, 110, 0.20);
+  --glass-shadow: 0 32px 64px -34px rgba(176, 108, 104, 0.40), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  --glass-blur: 16px;
+
+  --field-bg: rgba(255, 255, 255, 0.72);
+  --field-border: rgba(183, 110, 110, 0.24);
+  --field-focus: rgba(183, 110, 110, 0.6);
+  --field-focus-ring: rgba(207, 126, 126, 0.16);
+
+  --btn-grad: linear-gradient(180deg, #eca99a, #d27f80);
+  --btn-text: #46202f;
+  --btn-shadow: 0 16px 34px -14px rgba(207, 126, 126, 0.55);
+
+  --gold-grad: linear-gradient(180deg, #cf8f80 0%, #c2727a 55%, #a85f6a 100%);
+  --hairline: rgba(176, 108, 104, 0.16);
+}
+
+html,
+body {
+  background: var(--page-bg);
+  color: rgb(var(--c-cream));
+  font-family: var(--font-body, "Inter", system-ui, sans-serif);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  transition: background 0.6s ease;
+}
+
+/* ───────────────────────── backdrop ───────────────────────── */
+.cosmos-bg {
+  position: fixed;
+  inset: 0;
+  z-index: -3;
+  background: var(--cosmos-bg);
+  transition: background 0.6s ease;
+}
+
+.starfield {
   position: fixed;
   inset: 0;
   z-index: -1;
-  content: "";
   background-repeat: repeat;
-}
-.starfield {
   background-image:
     radial-gradient(1.4px 1.4px at 20% 30%, rgba(255, 255, 255, 0.9), transparent),
     radial-gradient(1.2px 1.2px at 70% 60%, rgba(255, 245, 220, 0.8), transparent),
@@ -47,63 +119,84 @@ body {
     radial-gradient(1px 1px at 90% 80%, rgba(230, 230, 255, 0.6), transparent);
   background-size: 100% 100%;
   animation: twinkle 7s ease-in-out infinite;
-  opacity: 0.55;
+  opacity: var(--star-opacity);
+  transition: opacity 0.6s ease;
 }
 @keyframes twinkle {
   0%, 100% { opacity: 0.4; }
   50% { opacity: 0.7; }
 }
 
-/* ---- Glass panels ------------------------------------------------------ */
-.glass {
-  background: linear-gradient(180deg, rgba(33, 27, 64, 0.62), rgba(18, 15, 38, 0.55));
-  border: 1px solid rgba(232, 200, 135, 0.16);
-  border-radius: 22px;
-  box-shadow: 0 24px 70px -30px rgba(0, 0, 0, 0.85), inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(14px);
+/* Soft drifting blooms — the ambient layer for Rose Aurora (invisible at night). */
+.aurora {
+  position: fixed;
+  inset: -20%;
+  z-index: -2;
+  opacity: var(--aurora-opacity);
+  transition: opacity 0.8s ease;
+  pointer-events: none;
+  background:
+    radial-gradient(420px 420px at 22% 30%, rgba(255, 178, 196, 0.45), transparent 70%),
+    radial-gradient(460px 460px at 78% 28%, rgba(255, 206, 166, 0.42), transparent 70%),
+    radial-gradient(520px 520px at 62% 78%, rgba(206, 184, 240, 0.40), transparent 70%),
+    radial-gradient(380px 380px at 30% 76%, rgba(255, 198, 214, 0.38), transparent 70%);
+  filter: blur(20px);
+  animation: drift 26s ease-in-out infinite alternate;
+}
+@keyframes drift {
+  0% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(2.5%, -2%, 0) scale(1.06); }
+  100% { transform: translate3d(-2%, 2.5%, 0) scale(1.02); }
 }
 
-.hairline {
-  border-top: 1px solid rgba(232, 200, 135, 0.14);
+/* ───────────────────────── components ───────────────────────── */
+.glass {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 22px;
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(var(--glass-blur));
+  transition: background 0.5s ease, border-color 0.5s ease, box-shadow 0.5s ease;
 }
+
+.hairline { border-top: 1px solid var(--hairline); }
 
 .gold-text {
-  background: linear-gradient(180deg, #f7e8c4 0%, #e8c887 55%, #c9a45f 100%);
+  background: var(--gold-grad);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
 }
 
-/* Inputs */
 .field {
-  background: rgba(10, 8, 26, 0.6);
-  border: 1px solid rgba(232, 200, 135, 0.18);
+  background: var(--field-bg);
+  border: 1px solid var(--field-border);
   border-radius: 12px;
-  color: #efe9f6;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  color: rgb(var(--c-cream));
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.4s ease;
 }
 .field:focus {
   outline: none;
-  border-color: rgba(232, 200, 135, 0.55);
-  box-shadow: 0 0 0 3px rgba(232, 200, 135, 0.12);
+  border-color: var(--field-focus);
+  box-shadow: 0 0 0 3px var(--field-focus-ring);
 }
-.field::placeholder { color: rgba(167, 159, 196, 0.55); }
-select.field option { background: #15122b; color: #efe9f6; }
+.field::placeholder { color: rgb(var(--c-haze) / 0.6); }
+.field option { background: rgb(var(--c-panel)); color: rgb(var(--c-cream)); }
 
 .btn-gold {
-  background: linear-gradient(180deg, #f4e0b0, #e2bd76);
-  color: #2b2206;
+  background: var(--btn-grad);
+  color: var(--btn-text);
   border-radius: 12px;
   font-weight: 600;
   letter-spacing: 0.02em;
-  box-shadow: 0 12px 30px -12px rgba(232, 200, 135, 0.6);
+  box-shadow: var(--btn-shadow);
   transition: transform 0.15s ease, box-shadow 0.2s ease, filter 0.2s ease;
 }
 .btn-gold:hover { transform: translateY(-1px); filter: brightness(1.05); }
 .btn-gold:active { transform: translateY(0); }
 .btn-gold:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
 
-/* ---- Chart wheel animations ------------------------------------------- */
+/* ───────────────────────── animations ───────────────────────── */
 .wheel-rise { animation: rise 1s cubic-bezier(0.16, 1, 0.3, 1) both; }
 @keyframes rise {
   from { opacity: 0; transform: scale(0.92) rotate(-4deg); }
@@ -119,9 +212,6 @@ select.field option { background: #15122b; color: #efe9f6; }
 .fade-up { animation: fadeUp 0.7s ease both; }
 @keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
-.slow-spin { transform-origin: center; animation: spin 220s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
-
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: rgba(232, 200, 135, 0.2); border-radius: 8px; }
+::-webkit-scrollbar-thumb { background: rgb(var(--c-gold) / 0.25); border-radius: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
