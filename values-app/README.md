@@ -12,6 +12,13 @@ its circular (circumplex) structure.
 
 ![results screen](./screenshots/04-results.png)
 
+**Mobile-adaptive & installable.** The experience is mobile-first responsive (safe-area
+aware, big thumb-friendly tap targets, the circumplex scales without clipping) and ships
+as an installable **PWA** — add it to a phone home screen and it runs full-screen and
+offline.
+
+<img src="./screenshots/mobile-results.png" alt="mobile results" width="260" /> <img src="./screenshots/mobile-maxdiff.png" alt="mobile trade-off" width="260" />
+
 ## Why this design (the short version)
 
 - **Backbone — Schwartz values.** The only individual-level value model that is

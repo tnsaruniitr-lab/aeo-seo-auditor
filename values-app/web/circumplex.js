@@ -83,18 +83,17 @@ export function renderCircumplex(profile) {
         <circle cx="${nx.toFixed(1)}" cy="${ny.toFixed(1)}" r="${rad.toFixed(1)}" fill="${v.color}" opacity="${(0.45 + emphasis * 0.55).toFixed(2)}"/>
         <circle cx="${nx.toFixed(1)}" cy="${ny.toFixed(1)}" r="${(rad + 2.5).toFixed(1)}" fill="none" stroke="${v.color}" stroke-width="1" opacity="${(emphasis * 0.5).toFixed(2)}"/>
         <text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" text-anchor="${anchor}" dominant-baseline="middle"
-              font-size="11.5" font-weight="${labelWeight}" fill="${labelColor}" font-family="Inter, sans-serif">${v.name}</text>
+              font-size="12.5" font-weight="${labelWeight}" fill="${labelColor}" font-family="Inter, sans-serif">${v.name}</text>
       </g>`
   }).join('')
 
-  // Apex labels (higher-order). Horizontal ones anchor outward (away from centre)
-  // so the long words never reach inward over the value labels.
+  // Apex labels (higher-order). The viewBox is padded so these sit fully inside
+  // it and scale down cleanly on mobile (never clipped at the screen edge).
   const SHORT = { self_transcendence: 'TRANSCENDENCE', openness: 'OPENNESS', self_enhancement: 'ENHANCEMENT', conservation: 'CONSERVATION' }
   const apexLabels = Object.entries(HIGHER_ORDER_META).map(([id, m]) => {
     const [x, y] = pt(m.apex, R + 50)
-    const anchor = m.apex === 180 ? 'end' : (m.apex === 0 || m.apex === 360) ? 'start' : 'middle'
-    return `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="${anchor}" dominant-baseline="middle"
-       font-size="10" letter-spacing="1.6" font-weight="700" fill="${m.color}" opacity="0.9"
+    return `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="middle" dominant-baseline="middle"
+       font-size="11" letter-spacing="1.6" font-weight="700" fill="${m.color}" opacity="0.9"
        font-family="Inter, sans-serif">${SHORT[id]}</text>`
   }).join('')
 
@@ -104,7 +103,7 @@ export function renderCircumplex(profile) {
 
   return `
   <div class="circ-wrap">
-    <svg viewBox="0 0 ${SIZE} ${SIZE}" role="img" aria-label="Your values circumplex">
+    <svg viewBox="-80 -12 620 484" role="img" aria-label="Your values circumplex">
       <defs>
         <radialGradient id="blobFill" cx="50%" cy="50%" r="60%">
           <stop offset="0%" stop-color="#a78bfa" stop-opacity="0.55"/>
