@@ -1,0 +1,127 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #070612;
+  color: #efe9f6;
+  font-family: var(--font-body, "Inter", system-ui, sans-serif);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ---- Cosmic backdrop --------------------------------------------------- */
+.cosmos-bg {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background:
+    radial-gradient(1100px 800px at 78% -10%, rgba(120, 86, 200, 0.30), transparent 60%),
+    radial-gradient(900px 700px at 12% 18%, rgba(196, 142, 170, 0.16), transparent 55%),
+    radial-gradient(1200px 900px at 50% 120%, rgba(72, 120, 150, 0.18), transparent 60%),
+    linear-gradient(180deg, #08071a 0%, #0a0820 45%, #070612 100%);
+}
+
+.starfield,
+.starfield::before,
+.starfield::after {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  content: "";
+  background-repeat: repeat;
+}
+.starfield {
+  background-image:
+    radial-gradient(1.4px 1.4px at 20% 30%, rgba(255, 255, 255, 0.9), transparent),
+    radial-gradient(1.2px 1.2px at 70% 60%, rgba(255, 245, 220, 0.8), transparent),
+    radial-gradient(1px 1px at 40% 80%, rgba(220, 220, 255, 0.7), transparent),
+    radial-gradient(1.6px 1.6px at 85% 25%, rgba(255, 255, 255, 0.85), transparent),
+    radial-gradient(1px 1px at 55% 15%, rgba(255, 255, 255, 0.6), transparent),
+    radial-gradient(1.1px 1.1px at 10% 70%, rgba(255, 235, 210, 0.7), transparent),
+    radial-gradient(1px 1px at 90% 80%, rgba(230, 230, 255, 0.6), transparent);
+  background-size: 100% 100%;
+  animation: twinkle 7s ease-in-out infinite;
+  opacity: 0.55;
+}
+@keyframes twinkle {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.7; }
+}
+
+/* ---- Glass panels ------------------------------------------------------ */
+.glass {
+  background: linear-gradient(180deg, rgba(33, 27, 64, 0.62), rgba(18, 15, 38, 0.55));
+  border: 1px solid rgba(232, 200, 135, 0.16);
+  border-radius: 22px;
+  box-shadow: 0 24px 70px -30px rgba(0, 0, 0, 0.85), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(14px);
+}
+
+.hairline {
+  border-top: 1px solid rgba(232, 200, 135, 0.14);
+}
+
+.gold-text {
+  background: linear-gradient(180deg, #f7e8c4 0%, #e8c887 55%, #c9a45f 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Inputs */
+.field {
+  background: rgba(10, 8, 26, 0.6);
+  border: 1px solid rgba(232, 200, 135, 0.18);
+  border-radius: 12px;
+  color: #efe9f6;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.field:focus {
+  outline: none;
+  border-color: rgba(232, 200, 135, 0.55);
+  box-shadow: 0 0 0 3px rgba(232, 200, 135, 0.12);
+}
+.field::placeholder { color: rgba(167, 159, 196, 0.55); }
+select.field option { background: #15122b; color: #efe9f6; }
+
+.btn-gold {
+  background: linear-gradient(180deg, #f4e0b0, #e2bd76);
+  color: #2b2206;
+  border-radius: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  box-shadow: 0 12px 30px -12px rgba(232, 200, 135, 0.6);
+  transition: transform 0.15s ease, box-shadow 0.2s ease, filter 0.2s ease;
+}
+.btn-gold:hover { transform: translateY(-1px); filter: brightness(1.05); }
+.btn-gold:active { transform: translateY(0); }
+.btn-gold:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+
+/* ---- Chart wheel animations ------------------------------------------- */
+.wheel-rise { animation: rise 1s cubic-bezier(0.16, 1, 0.3, 1) both; }
+@keyframes rise {
+  from { opacity: 0; transform: scale(0.92) rotate(-4deg); }
+  to { opacity: 1; transform: scale(1) rotate(0); }
+}
+.aspect-line { stroke-dasharray: 600; stroke-dashoffset: 600; animation: draw 1.6s ease forwards 0.5s; }
+@keyframes draw { to { stroke-dashoffset: 0; } }
+.planet-pop { opacity: 0; animation: pop 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+@keyframes pop {
+  from { opacity: 0; transform: translateY(4px) scale(0.6); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.fade-up { animation: fadeUp 0.7s ease both; }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+.slow-spin { transform-origin: center; animation: spin 220s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(232, 200, 135, 0.2); border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
