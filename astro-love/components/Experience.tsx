@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import BirthForm, { type BirthFormValues } from "./BirthForm";
 import ChartWheel from "./ChartWheel";
 import PlanetTable from "./PlanetTable";
@@ -77,6 +78,11 @@ function Header() {
         Your natal chart, computed from real astronomy — the precise foundation
         for math-based love and compatibility. <span className="text-cream/80">Не мистика, а точные наблюдения.</span>
       </p>
+      <div className="mt-6">
+        <Link href="/compatibility" className="btn-gold inline-flex items-center gap-2 px-7 py-2.5 text-sm">
+          ✦ Check love compatibility →
+        </Link>
+      </div>
     </header>
   );
 }

@@ -1,6 +1,6 @@
 // Aspect detection between two ecliptic longitudes (SPEC.md §6.4).
-// Used here for a single natal chart's internal aspects (the center lines of
-// the wheel). The same primitives feed synastry scoring in Milestone 2.
+// Shared by the natal wheel (a chart's own planets) and by synastry
+// (inter-chart contacts between two people).
 
 import type { AspectName, NatalAspect, PlacedBody } from "./types";
 
@@ -35,6 +35,23 @@ function allowedOrb(def: AspectDef, b1: string, b2: string): number {
   return def.baseOrb + bonus;
 }
 
+export interface AspectMatch {
+  def: AspectDef;
+  orb: number;
+  allowedOrb: number;
+}
+
+/** Closest in-orb major aspect between two bodies, or null. */
+export function matchAspect(sep: number, keyA: string, keyB: string): AspectMatch | null {
+  let best: AspectMatch | null = null;
+  for (const def of ASPECTS) {
+    const allow = allowedOrb(def, keyA, keyB);
+    const orb = Math.abs(sep - def.angle);
+    if (orb <= allow && (!best || orb < best.orb)) best = { def, orb, allowedOrb: allow };
+  }
+  return best;
+}
+
 /** All natal aspects among a chart's own planets (de-duplicated unordered pairs). */
 export function natalAspects(planets: PlacedBody[]): NatalAspect[] {
   const out: NatalAspect[] = [];
@@ -43,21 +60,15 @@ export function natalAspects(planets: PlacedBody[]): NatalAspect[] {
       const p = planets[i];
       const q = planets[j];
       const sep = separation(p.lon, q.lon);
-      let best: { def: AspectDef; orb: number } | null = null;
-      for (const def of ASPECTS) {
-        const orb = Math.abs(sep - def.angle);
-        if (orb <= allowedOrb(def, p.body, q.body)) {
-          if (!best || orb < best.orb) best = { def, orb };
-        }
-      }
-      if (best) {
+      const m = matchAspect(sep, p.body, q.body);
+      if (m) {
         out.push({
           a: p.id,
           b: q.id,
-          aspect: best.def.name,
+          aspect: m.def.name,
           angle: sep,
-          orb: Math.round(best.orb * 100) / 100,
-          valence: best.def.valence,
+          orb: Math.round(m.orb * 100) / 100,
+          valence: m.def.valence,
         });
       }
     }

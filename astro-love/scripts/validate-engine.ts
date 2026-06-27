@@ -8,6 +8,7 @@
 // plus almanac-level sanity checks on the Sun, and a printed reference chart.
 
 import { computeChart } from "../lib/astro/chart";
+import { computeSynastry } from "../lib/astro/synastry";
 import { mcFromRamc, ascFromRamc, wholeSignHouse } from "../lib/astro/angles";
 import { separation } from "../lib/astro/aspects";
 import { signFromLon, formatLon, norm360 } from "../lib/astro/zodiac";
@@ -101,6 +102,34 @@ const noTime = computeChart({
 check("unknown time → no Ascendant", noTime.asc === null);
 check("unknown time → planets have null house", noTime.planets.every((p) => p.house === null));
 check("unknown time → warning emitted", noTime.warnings.length > 0);
+
+console.log("\n── Synastry (compatibility) checks ──────────────────────────────");
+const spb = findCity("spb")!;
+const chartB = computeChart({
+  name: "Dmitri", place: "St Petersburg",
+  year: 1988, month: 8, day: 22, hour: 14, minute: 15, timeKnown: true,
+  lat: spb.lat, lon: spb.lon, tz: spb.tz,
+});
+const syn = computeSynastry(ref, chartB, "Anna", "Dmitri");
+check("score within 0–100", syn.score >= 0 && syn.score <= 100, `${syn.score}`);
+check("subscores within 0–100", Object.values(syn.subscores).every((v) => v >= 0 && v <= 100));
+check("at least one inter-chart aspect found", syn.aspects.length > 0, `${syn.aspects.length} aspects`);
+check("aspects sorted by points desc", syn.aspects.every((a, i, arr) => i === 0 || arr[i - 1].points >= a.points));
+check("every aspect has a plain-English sentence", syn.aspects.every((a) => a.sentence.length > 10));
+check("band label present", syn.band.label.length > 0, syn.band.label);
+// Determinism
+const syn2 = computeSynastry(ref, chartB, "Anna", "Dmitri");
+check("deterministic (same score on re-run)", syn.score === syn2.score && JSON.stringify(syn) === JSON.stringify(syn2));
+// Self-synastry should score very high (a chart is maximally "compatible" with itself)
+const selfSyn = computeSynastry(ref, ref, "A", "A");
+check("self-synastry scores higher than the couple", selfSyn.score > syn.score, `self ${selfSyn.score} > couple ${syn.score}`);
+
+console.log(`  Couple score: ${syn.score}/100 — "${syn.band.label}"`);
+console.log(`  Sub-scores  : emo ${syn.subscores.emotional} · attr ${syn.subscores.attraction} · aff ${syn.subscores.affection} · comm ${syn.subscores.communication} · commit ${syn.subscores.commitment}`);
+console.log(`  Top contacts:`);
+for (const a of syn.aspects.slice(0, 5)) {
+  console.log(`   +${a.points.toFixed(1).padStart(4)}  ${a.sentence}`);
+}
 
 console.log("\n── Reference chart: Moscow, 14 May 1990, 06:30 ──────────────────");
 console.log(`  UTC instant : ${ref.subject.utc}  (local ${ref.subject.localISO})`);

@@ -4,9 +4,11 @@ A Russian-native, **synastry-first** Web PWA that answers love questions from re
 
 The differentiator: not vague sun-signs and not a black-box score — every compatibility number traces back to named aspects ("Venus trine Mars, +6.8 pts"), and the AI layer interprets *only* the pre-computed chart facts (it writes the words, never the numbers).
 
-## Status — Milestone 1 built ✅ (natal engine + UX)
+## Status — Milestones 1 & 2 built ✅ (natal engine + synastry compatibility)
 
-A working **Next.js (App Router) PWA** with the deterministic natal-chart engine and a hand-crafted chart UI. You enter birth date / time / place and get a real, validated natal chart: planet positions, Ascendant, Midheaven, whole-sign houses, and an animated SVG chart wheel.
+A working **Next.js (App Router) PWA**:
+- **`/`** — enter birth date / time / place → a real, validated natal chart (planet positions, Ascendant, Midheaven, whole-sign houses) on an animated SVG wheel.
+- **`/compatibility`** — enter two people → a **0–100 compatibility score** with five sub-scores, a **synastry bi-wheel** (inner = Person A, outer = Person B, cross-chart aspect web), and a fully **explainable breakdown** where every point traces to a named, plain-English aspect ("Venus conjunct Mars +8.9") plus house overlays.
 
 ### Run it
 ```bash
@@ -17,6 +19,7 @@ npm run dev               # http://localhost:3000
 ```
 
 ### What's implemented
+- **Synastry engine (`lib/astro/synastry.ts`)** — the explainable weighted score (SPEC §6.5): inter-chart aspects × planet-pair weights × aspect-type coefficient × orb tightness, hard aspects scored net-positive, house overlays, saturating 0–100 normalization, five facet sub-scores — all in one auditable `CONFIG`. Emits per-aspect sentences so the number is self-explaining.
 - **Engine (`lib/astro`, `lib/geo`)** — deterministic, reproducible:
   - geocoding via a curated city DB (CIS + world) and **historical-DST-correct** UTC resolution (Luxon + IANA tz);
   - geocentric **ecliptic-of-date** planet longitudes via the MIT `astronomy-engine` (with the heliocentric / J2000-precession traps handled — see `ephemeris.ts`);
@@ -28,7 +31,7 @@ npm run dev               # http://localhost:3000
 - **Validation (`scripts/validate-engine.ts`)** — closed-form checks (Asc/MC reference values, whole-sign houses, 0/360 wraparound) plus almanac sanity (Sun sign/degree). The reference chart (Moscow, 14 May 1990) reproduces the real 1988–91 Saturn/Uranus/Neptune-in-Capricorn stack and a mid-May-1990 Mercury retrograde — and correctly resolves Moscow to **UTC+4** (summer time then), not today's UTC+3.
 
 ### Not yet (next milestones, per `SPEC.md` §12)
-M2 synastry scoring · M3 the Claude AI reading layer · M4 i18n (ru/uk/en) · M5 monetization + legal.
+M3 the Claude AI reading layer (grounded readings from the chart/synastry facts) · M4 i18n (ru/uk/en) · M5 monetization + legal.
 
 ## The spec
 **[`SPEC.md`](./SPEC.md)** — the full technical + product specification (engine math, synastry rubric, AI grounding, i18n, GDPR/privacy/Russia, monetization, roadmap, open decisions §13). Points tagged **⚠️ VERIFY** are the known accuracy traps; the M1 engine handles the engine-side ones.
