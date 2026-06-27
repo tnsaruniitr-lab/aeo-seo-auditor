@@ -1,6 +1,24 @@
 // @ts-check
 /** Renders the values circumplex as an animated SVG. Pure string output. */
-import { VALUES, VALUE_BY_ID, HIGHER_ORDER_META } from '../engine/index.js'
+import { VALUES, VALUE_BY_ID, HIGHER_ORDER_META, HIGHER_ORDER_DEEP } from '../engine/index.js'
+
+/** Per-theme drawing palette. */
+const PALETTES = {
+  dark: {
+    ring: 'rgba(255,255,255,0.08)', axis: 'rgba(255,255,255,0.07)', wedge: 0.06,
+    blob: [['0%', '#a78bfa', '0.55'], ['55%', '#5eead4', '0.30'], ['100%', '#38bdf8', '0.12']],
+    blobStroke: '#c4b5fd', blobStrokeOp: 0.65,
+    vec: ['#fef9c3', '#a78bfa'], vecTip: '#fef9c3',
+    center: '#eef0ff', mutedLabel: 'rgba(214,218,247,0.55)', deepHO: false,
+  },
+  bloom: {
+    ring: 'rgba(120,70,110,0.14)', axis: 'rgba(120,70,110,0.12)', wedge: 0.10,
+    blob: [['0%', '#ec4899', '0.26'], ['55%', '#a855f7', '0.18'], ['100%', '#14b8a6', '0.16']],
+    blobStroke: '#b06fd6', blobStrokeOp: 0.7,
+    vec: ['#f59e0b', '#ec4899'], vecTip: '#f59e0b',
+    center: '#5a3a52', mutedLabel: 'rgba(96,70,92,0.62)', deepHO: true,
+  },
+}
 
 const SIZE = 460
 const C = SIZE / 2
@@ -34,8 +52,11 @@ const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x))
 
 /**
  * @param {ReturnType<typeof import('../engine/index.js').buildProfile>} profile
+ * @param {{theme?: 'dark'|'bloom'}} [opts]
  */
-export function renderCircumplex(profile) {
+export function renderCircumplex(profile, opts = {}) {
+  const P = PALETTES[opts.theme] || PALETTES.dark
+  const hoColor = (id) => (P.deepHO ? HIGHER_ORDER_DEEP[id] : HIGHER_ORDER_META[id].color)
   const lo = -1.6; const hi = 1.6
   const radiusFor = (c) => (0.16 + 0.82 * clamp((c - lo) / (hi - lo), 0, 1)) * R
 
@@ -44,21 +65,21 @@ export function renderCircumplex(profile) {
   const blobPath = smoothClosedPath(blobPts)
 
   // Quadrant tints (4 apex wedges)
-  const wedges = Object.values(HIGHER_ORDER_META).map((m) => {
+  const wedges = Object.entries(HIGHER_ORDER_META).map(([id, m]) => {
     const a0 = m.apex - 45; const a1 = m.apex + 45
     const [x0, y0] = pt(a0, R + 18); const [x1, y1] = pt(a1, R + 18)
-    return `<path d="M ${C} ${C} L ${x0.toFixed(1)} ${y0.toFixed(1)} A ${R + 18} ${R + 18} 0 0 0 ${x1.toFixed(1)} ${y1.toFixed(1)} Z" fill="${m.color}" opacity="0.06"/>`
+    return `<path d="M ${C} ${C} L ${x0.toFixed(1)} ${y0.toFixed(1)} A ${R + 18} ${R + 18} 0 0 0 ${x1.toFixed(1)} ${y1.toFixed(1)} Z" fill="${hoColor(id)}" opacity="${P.wedge}"/>`
   }).join('')
 
   // Guide rings
   const rings = [0.4, 0.7, 1].map((t) =>
-    `<circle cx="${C}" cy="${C}" r="${(R * t).toFixed(1)}" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>`,
+    `<circle cx="${C}" cy="${C}" r="${(R * t).toFixed(1)}" fill="none" stroke="${P.ring}" stroke-width="1"/>`,
   ).join('')
 
   // Cross axes
   const axes = [[90, 270], [0, 180]].map(([p, q]) => {
     const [x0, y0] = pt(p, R); const [x1, y1] = pt(q, R)
-    return `<line x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}" stroke="rgba(255,255,255,0.07)" stroke-width="1"/>`
+    return `<line x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}" stroke="${P.axis}" stroke-width="1"/>`
   }).join('')
 
   // Value nodes + labels, sized by rank emphasis
@@ -76,7 +97,7 @@ export function renderCircumplex(profile) {
     const [lx, ly] = pt(v.angle, labelR)
     const anchor = onAxis ? 'middle' : lx < C - 12 ? 'end' : lx > C + 12 ? 'start' : 'middle'
     const isTop = profile.top.includes(v.id)
-    const labelColor = isTop ? v.color : 'rgba(214,218,247,0.55)'
+    const labelColor = isTop ? v.color : P.mutedLabel
     const labelWeight = isTop ? 600 : 400
     return `
       <g class="circ-node" style="animation-delay:${(0.5 + i * 0.04).toFixed(2)}s">
@@ -90,10 +111,10 @@ export function renderCircumplex(profile) {
   // Apex labels (higher-order). The viewBox is padded so these sit fully inside
   // it and scale down cleanly on mobile (never clipped at the screen edge).
   const SHORT = { self_transcendence: 'TRANSCENDENCE', openness: 'OPENNESS', self_enhancement: 'ENHANCEMENT', conservation: 'CONSERVATION' }
-  const apexLabels = Object.entries(HIGHER_ORDER_META).map(([id, m]) => {
-    const [x, y] = pt(m.apex, R + 50)
+  const apexLabels = Object.entries(HIGHER_ORDER_META).map(([id]) => {
+    const [x, y] = pt(HIGHER_ORDER_META[id].apex, R + 50)
     return `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="middle" dominant-baseline="middle"
-       font-size="11" letter-spacing="1.6" font-weight="700" fill="${m.color}" opacity="0.9"
+       font-size="11" letter-spacing="1.6" font-weight="700" fill="${hoColor(id)}" opacity="0.9"
        font-family="Inter, sans-serif">${SHORT[id]}</text>`
   }).join('')
 
@@ -106,13 +127,13 @@ export function renderCircumplex(profile) {
     <svg viewBox="-80 -12 620 484" role="img" aria-label="Your values circumplex">
       <defs>
         <radialGradient id="blobFill" cx="50%" cy="50%" r="60%">
-          <stop offset="0%" stop-color="#a78bfa" stop-opacity="0.55"/>
-          <stop offset="55%" stop-color="#5eead4" stop-opacity="0.30"/>
-          <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.12"/>
+          <stop offset="${P.blob[0][0]}" stop-color="${P.blob[0][1]}" stop-opacity="${P.blob[0][2]}"/>
+          <stop offset="${P.blob[1][0]}" stop-color="${P.blob[1][1]}" stop-opacity="${P.blob[1][2]}"/>
+          <stop offset="${P.blob[2][0]}" stop-color="${P.blob[2][1]}" stop-opacity="${P.blob[2][2]}"/>
         </radialGradient>
         <linearGradient id="vecGrad" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stop-color="#fef9c3"/>
-          <stop offset="100%" stop-color="#a78bfa"/>
+          <stop offset="0%" stop-color="${P.vec[0]}"/>
+          <stop offset="100%" stop-color="${P.vec[1]}"/>
         </linearGradient>
         <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
           <feGaussianBlur stdDeviation="6" result="b"/>
@@ -124,17 +145,17 @@ export function renderCircumplex(profile) {
       ${rings}
       ${axes}
 
-      <path class="circ-blob" d="${blobPath}" fill="url(#blobFill)" stroke="#c4b5fd" stroke-width="1.5" stroke-opacity="0.65" filter="url(#glow)"/>
+      <path class="circ-blob" d="${blobPath}" fill="url(#blobFill)" stroke="${P.blobStroke}" stroke-width="1.5" stroke-opacity="${P.blobStrokeOp}" filter="url(#glow)"/>
 
       <g filter="url(#glow)">
         <line class="circ-vector" x1="${C}" y1="${C}" x2="${vx.toFixed(1)}" y2="${vy.toFixed(1)}"
               stroke="url(#vecGrad)" stroke-width="3" stroke-linecap="round" pathLength="1"/>
-        <circle cx="${vx.toFixed(1)}" cy="${vy.toFixed(1)}" r="5" fill="#fef9c3"/>
+        <circle cx="${vx.toFixed(1)}" cy="${vy.toFixed(1)}" r="5" fill="${P.vecTip}"/>
       </g>
 
       ${nodes}
       ${apexLabels}
-      <circle cx="${C}" cy="${C}" r="3.5" fill="#eef0ff"/>
+      <circle cx="${C}" cy="${C}" r="3.5" fill="${P.center}"/>
     </svg>
   </div>`
 }

@@ -128,6 +128,14 @@ export const HIGHER_ORDER_META = /** @type {Record<HigherId, {name:string, apex:
   conservation: { name: 'Conservation', apex: 0, color: '#818cf8' },
 })
 
+/** Deeper higher-order colours for light themes (legible on pale backgrounds). */
+export const HIGHER_ORDER_DEEP = /** @type {Record<HigherId, string>} */ ({
+  self_transcendence: '#0f9d76',
+  openness: '#1f7fb8',
+  self_enhancement: '#d63a5c',
+  conservation: '#5b50c4',
+})
+
 /** The two bipolar value axes. */
 export const AXES = [
   { id: 'open_cons', posName: 'Openness to Change', negName: 'Conservation', pos: 'openness', neg: 'conservation' },

@@ -1,11 +1,25 @@
 // @ts-check
 import {
   PORTRAIT_ITEMS, PORTRAIT_SCALE, MAXDIFF_BLOCKS, VALUE_BY_ID, valueById,
-  HIGHER_ORDER_META, HIGHER_ORDER, analyze,
+  HIGHER_ORDER_META, HIGHER_ORDER_DEEP, HIGHER_ORDER, analyze,
 } from '../engine/index.js'
 import { renderCircumplex } from './circumplex.js'
 
 const root = /** @type {HTMLElement} */ (document.getElementById('app'))
+
+/* ------------------------------------------------------------------- theming */
+const THEME_BAR = { dark: '#0d0b1c', bloom: '#fff4ef' }
+let theme = 'dark'
+try { const s = localStorage.getItem('compass-theme'); if (s === 'dark' || s === 'bloom') theme = s } catch {}
+function applyTheme(t) {
+  theme = t
+  document.documentElement.dataset.theme = t
+  const meta = document.querySelector('meta[name="theme-color"]')
+  if (meta) meta.setAttribute('content', THEME_BAR[t] || THEME_BAR.dark)
+  try { localStorage.setItem('compass-theme', t) } catch {}
+}
+/** Theme-aware higher-order colour (deeper on the light Bloom theme). */
+const hoColor = (id) => (theme === 'bloom' ? HIGHER_ORDER_DEEP[id] : HIGHER_ORDER_META[id].color)
 
 const state = {
   step: 'welcome', // welcome | maxdiff | portrait | results
@@ -198,12 +212,12 @@ function viewResults() {
     const diff = pv - nv // positive → leans pos side
     const knob = 50 + Math.max(-48, Math.min(48, diff * 26))
     const pm = HIGHER_ORDER_META[ax.pos]; const nm = HIGHER_ORDER_META[ax.neg]
-    const lean = diff >= 0 ? pm : nm
+    const leanColor = hoColor(diff >= 0 ? ax.pos : ax.neg)
     return `
       <div class="axisbar">
-        <div class="lbls"><span style="color:${nm.color}">${nm.name}</span><span style="color:${pm.color}">${pm.name}</span></div>
+        <div class="lbls"><span style="color:${hoColor(ax.neg)}">${nm.name}</span><span style="color:${hoColor(ax.pos)}">${pm.name}</span></div>
         <div class="axistrack"><span class="mid"></span>
-          <span class="knob" style="left:${knob}%;background:${lean.color};color:${lean.color}"></span>
+          <span class="knob" style="left:${knob}%;background:${leanColor};color:${leanColor}"></span>
         </div>
       </div>`
   }).join('')
@@ -218,11 +232,11 @@ function viewResults() {
         <div class="results-grid">
           <div>
             <div class="hero-orient">Your centre of gravity</div>
-            <h2 class="hero-title" style="color:${dom.color}">${dom.name}</h2>
+            <h2 class="hero-title" style="color:${hoColor(profile.dominantHigher)}">${dom.name}</h2>
             <p class="fine" style="margin-bottom:18px">
               ${conv == null ? '' : `Your two signals agreed ~${conv}% — a rough, uncalibrated confidence cue.`}
             </p>
-            ${renderCircumplex(profile)}
+            ${renderCircumplex(profile, { theme })}
           </div>
           <div>
             <div class="hero-orient">What matters most — to you</div>
@@ -259,6 +273,15 @@ function render() {
   else if (state.step === 'portrait') viewPortrait()
   else if (state.step === 'results') viewResults()
   window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+// Apply the saved theme and wire the switcher (lives outside #app, so it
+// persists across re-renders). Re-render on change so the SVG palette updates.
+applyTheme(theme)
+const themeSel = /** @type {HTMLSelectElement|null} */ (document.getElementById('themeSelect'))
+if (themeSel) {
+  themeSel.value = theme
+  themeSel.addEventListener('change', () => { applyTheme(themeSel.value); render() })
 }
 
 render()
