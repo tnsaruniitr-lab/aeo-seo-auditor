@@ -8,6 +8,7 @@
     "test": "node --test",
     "demo": "node demo/demo.js",
     "serve": "node web/serve.js",
+    "build:standalone": "node scripts/build-standalone.mjs",
     "screenshots": "node scripts/screenshots.mjs"
   },
   "engines": {
