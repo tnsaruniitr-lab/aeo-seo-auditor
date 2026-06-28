@@ -1,0 +1,58 @@
+name: Deploy Astro-Love to GitHub Pages
+
+# Builds the static export in astro-love/ and publishes it to GitHub Pages.
+# One-time setup: repo Settings → Pages → Build and deployment → Source:
+# "GitHub Actions". Site URL: https://<owner>.github.io/aeo-seo-auditor/
+
+on:
+  push:
+    branches:
+      - main
+      - claude/horoscope-love-app-slavic-6xm8ai
+    paths:
+      - "astro-love/**"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: astro-love
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: astro-love/package-lock.json
+      - run: npm ci
+      - name: Build static export
+        env:
+          # Project Pages are served under /<repo>/ — must match the repo name.
+          NEXT_PUBLIC_BASE_PATH: /aeo-seo-auditor
+        run: npm run build
+      - run: touch out/.nojekyll
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: astro-love/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

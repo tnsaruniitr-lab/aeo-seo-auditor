@@ -7,8 +7,10 @@ import SynastryWheel from "./SynastryWheel";
 import ThemeSwatches from "./ThemeSwatches";
 import { useTheme } from "./ThemeProvider";
 import { BODIES } from "@/lib/astro/zodiac";
-import type { ChartFacts } from "@/lib/astro/types";
-import type { SynastryResult, SynAspect } from "@/lib/astro/synastry";
+import { computeChart } from "@/lib/astro/chart";
+import { computeSynastry, type SynastryResult, type SynAspect } from "@/lib/astro/synastry";
+import { findCity } from "@/lib/geo/cities";
+import type { ChartFacts, ChartInput } from "@/lib/astro/types";
 
 const GLYPH_FONT =
   '"Noto Sans Symbols2","Segoe UI Symbol","Apple Symbols","DejaVu Sans",serif';
@@ -42,14 +44,23 @@ export default function CoupleExperience({
   async function calculate() {
     setLoading(true);
     setError(null);
+    await new Promise((r) => setTimeout(r, 280)); // keep the "Reading the stars…" beat
     try {
-      const res = await fetch("/api/synastry", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ a, b }),
-      });
-      if (!res.ok) throw new Error((await res.json()).error ?? "Failed");
-      setResult(await res.json());
+      const toInput = (f: BirthFormValues): ChartInput => {
+        const c = findCity(f.cityId);
+        if (!c) throw new Error("Unknown city");
+        return {
+          name: f.name || undefined, place: c.name,
+          year: f.year, month: f.month, day: f.day, hour: f.hour, minute: f.minute,
+          timeKnown: f.timeKnown, lat: c.lat, lon: c.lon, tz: c.tz,
+        };
+      };
+      const inA = toInput(a);
+      const inB = toInput(b);
+      const chartA = computeChart(inA);
+      const chartB = computeChart(inB);
+      const syn = computeSynastry(chartA, chartB, inA.name ?? "Person A", inB.name ?? "Person B");
+      setResult({ a: chartA, b: chartB, syn });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong");
     } finally {

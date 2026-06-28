@@ -19,6 +19,15 @@ npm run validate:engine   # numerically validates the astronomy (closed-form + a
 npm run dev               # http://localhost:3000
 ```
 
+### View online (GitHub Pages)
+The app is a **fully static export** — the astrology engine runs in the browser, so
+there's no server to host. A GitHub Actions workflow (`.github/workflows/deploy-pages.yml`)
+builds it and publishes to Pages on every push.
+
+**One-time setup:** repo **Settings → Pages → Build and deployment → Source: "GitHub Actions"**.
+Then the site is live at `https://<owner>.github.io/aeo-seo-auditor/`.
+(`npm run build` produces the static site in `astro-love/out/`.)
+
 ### What's implemented
 - **Synastry engine (`lib/astro/synastry.ts`)** — the explainable weighted score (SPEC §6.5): inter-chart aspects × planet-pair weights × aspect-type coefficient × orb tightness, hard aspects scored net-positive, house overlays, saturating 0–100 normalization, five facet sub-scores — all in one auditable `CONFIG`. Emits per-aspect sentences so the number is self-explaining.
 - **Engine (`lib/astro`, `lib/geo`)** — deterministic, reproducible:

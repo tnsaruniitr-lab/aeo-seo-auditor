@@ -8,6 +8,8 @@ import PlanetTable from "./PlanetTable";
 import ThemeSwatches from "./ThemeSwatches";
 import { useTheme } from "./ThemeProvider";
 import { SIGNS, BODIES } from "@/lib/astro/zodiac";
+import { computeChart } from "@/lib/astro/chart";
+import { findCity } from "@/lib/geo/cities";
 import type { ChartFacts } from "@/lib/astro/types";
 
 const GLYPH_FONT =
@@ -27,14 +29,21 @@ export default function Experience({
   async function onSubmit(v: BirthFormValues) {
     setLoading(true);
     setError(null);
+    // Compute in the browser (no server needed → static-host friendly).
+    // A short beat keeps the "Reading the sky…" moment.
+    await new Promise((r) => setTimeout(r, 250));
     try {
-      const res = await fetch("/api/chart", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(v),
-      });
-      if (!res.ok) throw new Error((await res.json()).error ?? "Failed");
-      setChart(await res.json());
+      const c = findCity(v.cityId);
+      if (!c) throw new Error("Unknown city");
+      setChart(
+        computeChart({
+          name: v.name || undefined,
+          place: c.name,
+          year: v.year, month: v.month, day: v.day, hour: v.hour, minute: v.minute,
+          timeKnown: v.timeKnown,
+          lat: c.lat, lon: c.lon, tz: c.tz,
+        }),
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong");
     } finally {
