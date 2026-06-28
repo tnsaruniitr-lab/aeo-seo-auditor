@@ -55,7 +55,7 @@ function viewWelcome() {
     <section class="view">
       <div class="card">
         <div class="eyebrow">Compass · values discovery</div>
-        <h1 class="display">What do you <em>really</em><br/>value?</h1>
+        <h1 class="display">What do you <em>really</em>&nbsp;value?</h1>
         <p class="lede">
           Not the values you'd <i>like</i> to have — the ones you actually live by. This short
           experience uses forced trade-offs and indirect questions, grounded in the
@@ -85,7 +85,7 @@ function viewMaxDiff() {
     const cls = cur.best === id ? 'most' : cur.worst === id ? 'least' : ''
     return `
       <div class="md-row ${cls}" data-id="${id}">
-        <span class="label"><span class="dot" style="color:${v.color}"></span>${v.short}</span>
+        <span class="label"><span class="dot" style="color:${v.color}"></span><span class="txt">${v.short}</span></span>
         <span class="pick">
           <button class="most ${cur.best === id ? 'on' : ''}" data-pick="best" data-id="${id}">Most</button>
           <button class="least ${cur.worst === id ? 'on' : ''}" data-pick="worst" data-id="${id}">Least</button>
@@ -103,7 +103,7 @@ function viewMaxDiff() {
         </div>
         <div class="md-list">${rows}</div>
         <div class="btn-row">
-          <button class="btn" data-next ${cur.best && cur.worst ? '' : 'disabled style="opacity:.45;cursor:not-allowed"'}>Continue →</button>
+          <button class="btn" data-next ${cur.best && cur.worst ? '' : 'disabled'}>Continue →</button>
           <span class="fine">Pick one “Most” and one “Least”.</span>
         </div>
       </div>
@@ -143,7 +143,7 @@ function viewPortrait() {
       <div class="card">
         ${topbar(true)}
         <div class="qhead"><div class="k">Reflect · ${state.ptIndex + 1} of ${PORTRAIT_ITEMS.length}</div>
-          <h2 style="font-size:18px;color:var(--muted);font-family:var(--font-body);font-weight:500;margin-top:8px">How much is this person like you?</h2>
+          <h2 class="subq">How much is this person like you?</h2>
         </div>
         <blockquote class="quote" data-value="${item.valueId}">${item.text}</blockquote>
         <div class="scale">
@@ -281,7 +281,15 @@ applyTheme(theme)
 const themeSel = /** @type {HTMLSelectElement|null} */ (document.getElementById('themeSelect'))
 if (themeSel) {
   themeSel.value = theme
-  themeSel.addEventListener('change', () => { applyTheme(themeSel.value); render() })
+  themeSel.addEventListener('change', () => {
+    // Cross-fade colours during the switch and suppress the entrance keyframe so
+    // the two transitions don't fight (see .theme-animating rules in styles.css).
+    const html = document.documentElement
+    html.classList.add('theme-animating')
+    applyTheme(themeSel.value)
+    render()
+    setTimeout(() => html.classList.remove('theme-animating'), 520)
+  })
 }
 
 render()

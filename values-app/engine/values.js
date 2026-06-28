@@ -130,9 +130,9 @@ export const HIGHER_ORDER_META = /** @type {Record<HigherId, {name:string, apex:
 
 /** Deeper higher-order colours for light themes (legible on pale backgrounds). */
 export const HIGHER_ORDER_DEEP = /** @type {Record<HigherId, string>} */ ({
-  self_transcendence: '#0f9d76',
+  self_transcendence: '#0a6e52',
   openness: '#1f7fb8',
-  self_enhancement: '#d63a5c',
+  self_enhancement: '#cc2f52',
   conservation: '#5b50c4',
 })
 

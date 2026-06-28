@@ -12,11 +12,15 @@ const PALETTES = {
     center: '#eef0ff', mutedLabel: 'rgba(214,218,247,0.55)', deepHO: false,
   },
   bloom: {
-    ring: 'rgba(120,70,110,0.14)', axis: 'rgba(120,70,110,0.12)', wedge: 0.10,
-    blob: [['0%', '#ec4899', '0.26'], ['55%', '#a855f7', '0.18'], ['100%', '#14b8a6', '0.16']],
-    blobStroke: '#b06fd6', blobStrokeOp: 0.7,
-    vec: ['#f59e0b', '#ec4899'], vecTip: '#f59e0b',
-    center: '#5a3a52', mutedLabel: 'rgba(96,70,92,0.62)', deepHO: true,
+    ring: 'rgba(101,74,110,0.28)', axis: 'rgba(101,74,110,0.22)', wedge: 0.14,
+    // Warm rose core → orchid → peach rim (no cold teal terminator); higher alpha
+    // so the fill keeps its saturation on a near-white ground instead of greying out.
+    blob: [['0%', '#f0518f', '0.55'], ['50%', '#c47ad8', '0.42'], ['100%', '#ffb39c', '0.30']],
+    blobStroke: '#d65a9e', blobStrokeOp: 0.85,
+    // The key indicator must be the highest-contrast mark: a deep magenta→raspberry
+    // stroke reads as deliberate ink over the pale-pink blob.
+    vec: ['#7a2f9e', '#c2185b'], vecTip: '#7a1f6e',
+    center: '#5a3a52', mutedLabel: '#5f4b66', deepHO: true,
   },
 }
 
@@ -100,7 +104,7 @@ export function renderCircumplex(profile, opts = {}) {
     const labelColor = isTop ? v.color : P.mutedLabel
     const labelWeight = isTop ? 600 : 400
     return `
-      <g class="circ-node" style="animation-delay:${(0.5 + i * 0.04).toFixed(2)}s">
+      <g class="circ-node" style="animation-delay:${(1.1 + i * 0.05).toFixed(2)}s">
         <circle cx="${nx.toFixed(1)}" cy="${ny.toFixed(1)}" r="${rad.toFixed(1)}" fill="${v.color}" opacity="${(0.45 + emphasis * 0.55).toFixed(2)}"/>
         <circle cx="${nx.toFixed(1)}" cy="${ny.toFixed(1)}" r="${(rad + 2.5).toFixed(1)}" fill="none" stroke="${v.color}" stroke-width="1" opacity="${(emphasis * 0.5).toFixed(2)}"/>
         <text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" text-anchor="${anchor}" dominant-baseline="middle"
@@ -114,7 +118,7 @@ export function renderCircumplex(profile, opts = {}) {
   const apexLabels = Object.entries(HIGHER_ORDER_META).map(([id]) => {
     const [x, y] = pt(HIGHER_ORDER_META[id].apex, R + 50)
     return `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="middle" dominant-baseline="middle"
-       font-size="11" letter-spacing="1.6" font-weight="700" fill="${hoColor(id)}" opacity="0.9"
+       font-size="11" letter-spacing="1.6" font-weight="700" fill="${hoColor(id)}" opacity="${P.deepHO ? '1' : '0.9'}"
        font-family="Inter, sans-serif">${SHORT[id]}</text>`
   }).join('')
 
