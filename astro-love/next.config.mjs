@@ -1,17 +1,20 @@
 /** @type {import('next').NextConfig} */
 
-// Static export so the app can be hosted on GitHub Pages (no server needed —
-// the astrology engine runs in the browser). basePath is set for project
-// Pages (https://<user>.github.io/<repo>/) via NEXT_PUBLIC_BASE_PATH.
-const basePath = process.env.NEXT_PUBLIC_BASE_PATH || "";
+// Two deploy targets, one config:
+//  - Default build → a normal Next.js server (for Railway / any Node host).
+//    Supports SSR + future API routes (e.g. the Claude AI layer in M3).
+//  - STATIC_EXPORT=1 → a static export for GitHub Pages (no server). The
+//    engine runs in the browser either way, so both work today.
+const isExport = process.env.STATIC_EXPORT === "1";
+const basePath = (isExport && process.env.NEXT_PUBLIC_BASE_PATH) || "";
 
 const nextConfig = {
   reactStrictMode: true,
-  output: "export",
   trailingSlash: true,
-  basePath,
-  assetPrefix: basePath || undefined,
   images: { unoptimized: true },
+  ...(isExport
+    ? { output: "export", basePath, assetPrefix: basePath || undefined }
+    : {}),
 };
 
 export default nextConfig;

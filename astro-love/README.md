@@ -26,7 +26,18 @@ builds it and publishes to Pages on every push.
 
 **One-time setup:** repo **Settings → Pages → Build and deployment → Source: "GitHub Actions"**.
 Then the site is live at `https://<owner>.github.io/aeo-seo-auditor/`.
-(`npm run build` produces the static site in `astro-love/out/`.)
+(The Pages workflow builds with `STATIC_EXPORT=1`, producing `astro-love/out/`.)
+
+### Deploy on Railway (full server — recommended for the AI layer)
+The default build (no `STATIC_EXPORT`) is a **normal Next.js server**, which Railway can host
+and which supports SSR + future API routes (the M3 Claude reading layer needs a server to hold
+the API key — static Pages can't do that).
+
+In Railway: **New Project → Deploy from GitHub repo** → pick this repo → in the service's
+**Settings → Root Directory** set **`astro-love`**. Railway (Nixpacks) then runs `npm ci` →
+`npm run build` → the `railway.json` start command (`next start` on `$PORT`). Done — you get a
+live URL that runs the full app. (One config serves both targets: Railway uses the server build,
+GitHub Pages uses the static export.)
 
 ### What's implemented
 - **Synastry engine (`lib/astro/synastry.ts`)** — the explainable weighted score (SPEC §6.5): inter-chart aspects × planet-pair weights × aspect-type coefficient × orb tightness, hard aspects scored net-positive, house overlays, saturating 0–100 normalization, five facet sub-scores — all in one auditable `CONFIG`. Emits per-aspect sentences so the number is self-explaining.

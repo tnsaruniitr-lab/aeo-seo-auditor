@@ -39,6 +39,7 @@ jobs:
       - run: npm ci
       - name: Build static export
         env:
+          STATIC_EXPORT: "1"
           # Project Pages are served under /<repo>/ — must match the repo name.
           NEXT_PUBLIC_BASE_PATH: /aeo-seo-auditor
         run: npm run build
