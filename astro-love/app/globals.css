@@ -25,6 +25,7 @@
     linear-gradient(180deg, #08071a 0%, #0a0820 45%, #070612 100%);
   --star-opacity: 0.55;
   --aurora-opacity: 0;
+  --aurora-bg: none;
 
   --glass-bg: linear-gradient(180deg, rgba(33, 27, 64, 0.62), rgba(18, 15, 38, 0.55));
   --glass-border: rgba(232, 200, 135, 0.16);
@@ -66,6 +67,11 @@
     linear-gradient(180deg, #fdf5f1 0%, #fbeef0 50%, #fdf3ee 100%);
   --star-opacity: 0;
   --aurora-opacity: 1;
+  --aurora-bg:
+    radial-gradient(420px 420px at 22% 30%, rgba(255, 178, 196, 0.45), transparent 70%),
+    radial-gradient(460px 460px at 78% 28%, rgba(255, 206, 166, 0.42), transparent 70%),
+    radial-gradient(520px 520px at 62% 78%, rgba(206, 184, 240, 0.40), transparent 70%),
+    radial-gradient(380px 380px at 30% 76%, rgba(255, 198, 214, 0.38), transparent 70%);
 
   --glass-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(255, 250, 248, 0.62));
   --glass-border: rgba(183, 110, 110, 0.20);
@@ -83,6 +89,136 @@
 
   --gold-grad: linear-gradient(180deg, #cf8f80 0%, #c2727a 55%, #a85f6a 100%);
   --hairline: rgba(176, 108, 104, 0.16);
+}
+
+/* ── Velvet Rouge — deep wine + rose-gold (love, rising hearts) ── */
+[data-theme="velvet"] {
+  color-scheme: dark;
+  --c-ink: 22 10 18;
+  --c-cosmos: 32 16 26;
+  --c-panel: 60 24 40;
+  --c-gold: 231 173 148;
+  --c-goldbright: 243 201 176;
+  --c-rose: 255 126 156;
+  --c-teal: 127 182 196;
+  --c-lilac: 201 167 230;
+  --c-haze: 201 154 166;
+  --c-cream: 244 224 227;
+
+  --page-bg: #160a12;
+  --cosmos-bg:
+    radial-gradient(1100px 800px at 78% -10%, rgba(170, 40, 70, 0.32), transparent 60%),
+    radial-gradient(900px 700px at 12% 18%, rgba(120, 30, 60, 0.30), transparent 55%),
+    radial-gradient(1200px 900px at 50% 120%, rgba(90, 30, 60, 0.30), transparent 60%),
+    linear-gradient(180deg, #1c0b15 0%, #19090f 50%, #140810 100%);
+  --star-opacity: 0;
+  --aurora-opacity: 0;
+  --aurora-bg: none;
+
+  --glass-bg: linear-gradient(180deg, rgba(70, 28, 46, 0.55), rgba(40, 16, 28, 0.5));
+  --glass-border: rgba(231, 173, 148, 0.18);
+  --glass-shadow: 0 24px 70px -30px rgba(0, 0, 0, 0.85), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --glass-blur: 14px;
+
+  --field-bg: rgba(30, 12, 22, 0.6);
+  --field-border: rgba(231, 173, 148, 0.20);
+  --field-focus: rgba(231, 173, 148, 0.55);
+  --field-focus-ring: rgba(231, 173, 148, 0.14);
+
+  --btn-grad: linear-gradient(180deg, #f3c9b0, #e0928f);
+  --btn-text: #2a0f17;
+  --btn-shadow: 0 12px 30px -12px rgba(231, 140, 150, 0.5);
+
+  --gold-grad: linear-gradient(180deg, #f3c9b0 0%, #e7ad94 55%, #d68f8a 100%);
+  --hairline: rgba(231, 173, 148, 0.14);
+}
+
+/* ── Peony Bloom — soft pink (love, falling petals) ── */
+[data-theme="peony"] {
+  color-scheme: light;
+  --c-ink: 253 240 242;
+  --c-cosmos: 254 244 246;
+  --c-panel: 255 255 255;
+  --c-gold: 200 122 134;
+  --c-goldbright: 182 95 118;
+  --c-rose: 212 86 127;
+  --c-teal: 79 134 147;
+  --c-lilac: 138 112 184;
+  --c-haze: 168 125 143;
+  --c-cream: 90 46 68;
+
+  --page-bg: #fdf0f2;
+  --cosmos-bg:
+    radial-gradient(1100px 820px at 82% -12%, rgba(255, 180, 205, 0.55), transparent 60%),
+    radial-gradient(950px 720px at 6% 16%, rgba(255, 205, 210, 0.5), transparent 58%),
+    radial-gradient(1050px 940px at 50% 116%, rgba(235, 200, 240, 0.5), transparent 62%),
+    radial-gradient(760px 640px at 96% 72%, rgba(255, 195, 220, 0.48), transparent 60%),
+    linear-gradient(180deg, #fdf2f4 0%, #fce9ef 50%, #fdf1f3 100%);
+  --star-opacity: 0;
+  --aurora-opacity: 0;
+  --aurora-bg: none;
+
+  --glass-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(255, 248, 250, 0.64));
+  --glass-border: rgba(196, 95, 134, 0.18);
+  --glass-shadow: 0 32px 64px -34px rgba(196, 95, 134, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  --glass-blur: 16px;
+
+  --field-bg: rgba(255, 255, 255, 0.74);
+  --field-border: rgba(196, 95, 134, 0.22);
+  --field-focus: rgba(196, 95, 134, 0.55);
+  --field-focus-ring: rgba(212, 86, 127, 0.16);
+
+  --btn-grad: linear-gradient(180deg, #f0a6be, #de6f93);
+  --btn-text: #4a1f33;
+  --btn-shadow: 0 16px 34px -14px rgba(212, 86, 127, 0.5);
+
+  --gold-grad: linear-gradient(180deg, #d98aa0 0%, #c8607f 55%, #b65f76 100%);
+  --hairline: rgba(196, 95, 134, 0.16);
+}
+
+/* ── Twilight — dusk indigo/violet, gentle aurora ── */
+[data-theme="twilight"] {
+  color-scheme: dark;
+  --c-ink: 17 13 40;
+  --c-cosmos: 25 18 54;
+  --c-panel: 36 27 70;
+  --c-gold: 233 182 144;
+  --c-goldbright: 243 211 176;
+  --c-rose: 231 154 192;
+  --c-teal: 134 192 208;
+  --c-lilac: 195 174 240;
+  --c-haze: 169 159 201;
+  --c-cream: 233 228 245;
+
+  --page-bg: #110d28;
+  --cosmos-bg:
+    radial-gradient(1100px 820px at 80% -10%, rgba(150, 110, 230, 0.34), transparent 60%),
+    radial-gradient(950px 720px at 10% 16%, rgba(231, 154, 192, 0.22), transparent 58%),
+    radial-gradient(1050px 940px at 50% 118%, rgba(233, 182, 144, 0.18), transparent 62%),
+    linear-gradient(180deg, #1a1440 0%, #140f30 50%, #100b24 100%);
+  --star-opacity: 0.35;
+  --aurora-opacity: 1;
+  --aurora-bg:
+    radial-gradient(460px 460px at 24% 30%, rgba(150, 110, 230, 0.40), transparent 70%),
+    radial-gradient(480px 480px at 78% 26%, rgba(231, 154, 192, 0.34), transparent 70%),
+    radial-gradient(540px 540px at 60% 80%, rgba(233, 182, 144, 0.26), transparent 70%);
+
+  --glass-bg: linear-gradient(180deg, rgba(48, 38, 90, 0.58), rgba(28, 22, 56, 0.5));
+  --glass-border: rgba(233, 182, 144, 0.18);
+  --glass-shadow: 0 24px 70px -30px rgba(0, 0, 0, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --glass-blur: 14px;
+
+  --field-bg: rgba(20, 15, 40, 0.6);
+  --field-border: rgba(233, 182, 144, 0.20);
+  --field-focus: rgba(233, 182, 144, 0.55);
+  --field-focus-ring: rgba(233, 182, 144, 0.14);
+
+  --btn-grad: linear-gradient(180deg, #f3d3b0, #e6a98f);
+  --btn-text: #2a1f12;
+  --btn-shadow: 0 12px 30px -12px rgba(233, 182, 144, 0.5);
+
+  --gold-grad: linear-gradient(180deg, #f3d3b0 0%, #e9b690 55%, #d6a06a 100%);
+  --hairline: rgba(233, 182, 144, 0.14);
 }
 
 html,
@@ -135,11 +271,7 @@ body {
   opacity: var(--aurora-opacity);
   transition: opacity 0.8s ease;
   pointer-events: none;
-  background:
-    radial-gradient(420px 420px at 22% 30%, rgba(255, 178, 196, 0.45), transparent 70%),
-    radial-gradient(460px 460px at 78% 28%, rgba(255, 206, 166, 0.42), transparent 70%),
-    radial-gradient(520px 520px at 62% 78%, rgba(206, 184, 240, 0.40), transparent 70%),
-    radial-gradient(380px 380px at 30% 76%, rgba(255, 198, 214, 0.38), transparent 70%);
+  background: var(--aurora-bg);
   filter: blur(20px);
   animation: drift 26s ease-in-out infinite alternate;
 }
@@ -215,3 +347,51 @@ body {
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: rgb(var(--c-gold) / 0.25); border-radius: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ───────────────────────── ambient particle FX ───────────────────────── */
+.fx-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 40; /* drift gently in front of the UI */
+  overflow: hidden;
+  pointer-events: none;
+}
+.fx-item {
+  position: absolute;
+  will-change: transform, opacity;
+}
+
+/* rising hearts (Velvet Rouge) */
+.fx-heart {
+  bottom: -6vh;
+  opacity: 0;
+  filter: drop-shadow(0 0 6px rgba(255, 120, 150, 0.5));
+  animation: floatUp var(--dur) ease-in infinite;
+  animation-delay: var(--delay);
+}
+@keyframes floatUp {
+  0% { transform: translateY(0) translateX(0) scale(var(--s)) rotate(-6deg); opacity: 0; }
+  12% { opacity: var(--o); }
+  85% { opacity: var(--o); }
+  100% { transform: translateY(-116vh) translateX(var(--dx)) scale(var(--s)) rotate(8deg); opacity: 0; }
+}
+
+/* falling petals (Peony Bloom) */
+.fx-petal {
+  top: -8vh;
+  opacity: 0;
+  filter: drop-shadow(0 2px 4px rgba(200, 90, 130, 0.25));
+  animation: fallDown var(--dur) linear infinite;
+  animation-delay: var(--delay);
+}
+@keyframes fallDown {
+  0% { transform: translateY(0) translateX(0) rotate(0deg); opacity: 0; }
+  12% { opacity: var(--o); }
+  85% { opacity: var(--o); }
+  100% { transform: translateY(118vh) translateX(var(--dx)) rotate(var(--r)); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fx-heart, .fx-petal, .aurora, .starfield, .slow-spin { animation: none !important; }
+  .fx-layer { display: none; }
+}

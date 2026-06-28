@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useContext, useEffect, useState } from "react";
-import { PALETTES, type ThemeKey, type WheelPalette } from "@/lib/theme";
+import { PALETTES, THEME_KEYS, type ThemeKey, type WheelPalette } from "@/lib/theme";
 
 interface ThemeCtx {
   theme: ThemeKey;
@@ -22,8 +22,8 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [theme, setThemeState] = useState<ThemeKey>("night");
 
   useEffect(() => {
-    const attr = document.documentElement.getAttribute("data-theme");
-    if (attr === "dawn" || attr === "night") setThemeState(attr);
+    const attr = document.documentElement.getAttribute("data-theme") as ThemeKey | null;
+    if (attr && (THEME_KEYS as string[]).includes(attr)) setThemeState(attr);
   }, []);
 
   const setTheme = (t: ThemeKey) => {

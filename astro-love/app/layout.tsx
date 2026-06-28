@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { ThemeProvider } from "@/components/ThemeProvider";
+import ThemeFX from "@/components/ThemeFX";
 
 export const metadata: Metadata = {
   title: "Astro-Love · Natal Chart",
@@ -14,7 +15,7 @@ export const viewport: Viewport = {
 };
 
 // Apply the saved theme before first paint to avoid a flash.
-const BOOT = `(function(){try{var t=localStorage.getItem('astro-theme');if(t!=='dawn'&&t!=='night')t='night';document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','night');}})();`;
+const BOOT = `(function(){try{var ok=['night','dawn','velvet','peony','twilight'];var t=localStorage.getItem('astro-theme');if(ok.indexOf(t)<0)t='night';document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','night');}})();`;
 
 export default function RootLayout({
   children,
@@ -36,7 +37,10 @@ export default function RootLayout({
         <div className="cosmos-bg" />
         <div className="aurora" />
         <div className="starfield" />
-        <ThemeProvider>{children}</ThemeProvider>
+        <ThemeProvider>
+          <ThemeFX />
+          {children}
+        </ThemeProvider>
       </body>
     </html>
   );

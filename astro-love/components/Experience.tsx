@@ -5,7 +5,7 @@ import Link from "next/link";
 import BirthForm, { type BirthFormValues } from "./BirthForm";
 import ChartWheel from "./ChartWheel";
 import PlanetTable from "./PlanetTable";
-import ThemeSwitcher from "./ThemeSwitcher";
+import ThemeSwatches from "./ThemeSwatches";
 import { useTheme } from "./ThemeProvider";
 import { SIGNS, BODIES } from "@/lib/astro/zodiac";
 import type { ChartFacts } from "@/lib/astro/types";
@@ -44,8 +44,8 @@ export default function Experience({
 
   return (
     <main className="relative mx-auto max-w-6xl px-4 sm:px-6 py-8 sm:py-12">
-      <div className="flex justify-end mb-4">
-        <ThemeSwitcher />
+      <div className="flex justify-center mb-6">
+        <ThemeSwatches />
       </div>
       <Header />
 
